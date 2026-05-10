@@ -1,6 +1,6 @@
-//! Gen3 Carbon wire formats and transaction builders.
+//! Carbon wire formats and transaction builders.
 //!
-//! Carbon uses a different binary format from the classic VM. This module keeps
+//! Carbon uses a different binary format from the VM. This module keeps
 //! the low-level reader/writer, schema-aware dynamic values, token/NFT helper
 //! structures, and signed transaction messages together so shared vectors can
 //! validate byte-level parity against the reference SDKs.

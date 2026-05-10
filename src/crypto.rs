@@ -1,4 +1,4 @@
-//! Cryptographic primitives used by both classic and Carbon transactions.
+//! Cryptographic primitives used by VM script and Carbon transactions.
 //!
 //! Keys, addresses, WIF handling, signatures, and hash difficulty live here so
 //! higher-level builders do not need to know Phantasma address byte layout.
@@ -223,7 +223,7 @@ impl Hash {
 
     pub fn difficulty(&self) -> u32 {
         // Phantasma PoW difficulty is measured from the last set bit in the
-        // little-endian hash representation, matching the classic SDKs.
+        // little-endian hash representation used by VM transaction tooling.
         let mut last_set_bit = 0u32;
         for (byte_index, byte) in self.0.iter().copied().enumerate() {
             for bit_index in 0..8 {

@@ -1,6 +1,6 @@
-//! Classic VM script and object helpers.
+//! VM script and object helpers.
 //!
-//! ScriptBuilder follows the current Python rewrite surface but keeps Rust
+//! ScriptBuilder follows the current Python SDK public surface while keeping Rust
 //! error handling: builder methods latch errors and `end_script()` reports them
 //! instead of emitting partially invalid scripts.
 
@@ -442,7 +442,7 @@ pub struct ScriptBuilder {
     writer: BinaryWriter,
     jump_locations: BTreeMap<usize, String>,
     label_locations: BTreeMap<String, usize>,
-    // Builder methods return `&mut Self` for ergonomic chaining, so invalid
+    // Builder methods return `&mut Self` for chaining, so invalid
     // operations are stored and surfaced only when the final script is requested.
     error: Option<PhantasmaError>,
 }

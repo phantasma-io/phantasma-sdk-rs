@@ -1,18 +1,17 @@
 # Rust SDK Feature Parity
 
-This crate follows the Python SDK rewrite as the immediate reference and keeps
-wire-format behavior aligned with the C#, TypeScript, C++, Go, and Python SDKs
-where those SDKs expose the same surface.
+This crate keeps public behavior and wire formats aligned with the Python, C#,
+TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
 
 ## Implemented Surface
 
-- Classic binary encoding: varuint, varbytes, strings, timestamps, BigInt VM
+- VM binary encoding: varuint, varbytes, strings, timestamps, BigInt VM
   encoding, bounded readers.
 - Cryptography: Base58, hex, WIF, Ed25519 key derivation, Phantasma address text,
   signatures, SHA-256 hash difficulty.
-- Classic VM: opcodes, VM object decoding, script builder labels, contract calls,
+- VM: opcodes, VM object decoding, script builder labels, contract calls,
   gas helpers, token transfer helpers.
-- Classic transactions: hash, sign, verify signer, serialize, deserialize,
+- VM script transactions: hash, sign, verify signer, serialize, deserialize,
   low-difficulty local proof-of-work.
 - Carbon serialization: fixed bytes, zero-terminated strings, arrays, BigInt,
   `IntX`, generic and typed integer arrays, dynamic VM schemas/structs, token
@@ -22,8 +21,8 @@ where those SDKs expose the same surface.
   parsed token-schema JSON shape (`TokenSchemasJson` / `TokenSchemasJSON`),
   schema JSON-to-wire builders, market/config call args, result parsers.
 - JSON-RPC: async client, injectable transport for tests, read methods for common
-  account/block/token/NFT/archive/contract/state calls, send helpers for classic
-  and Carbon transactions, response DTOs with serde defaults and scalar
+  account/block/token/NFT/archive/contract/state calls, send helpers for VM
+  script and Carbon transactions, response DTOs with serde defaults and scalar
   coercion for reference RPC response quirks.
 
 ## Rust API Decisions
@@ -31,8 +30,8 @@ where those SDKs expose the same surface.
 - Errors use one `PhantasmaError` enum and `Result<T>` alias.
 - Public builders validate inputs before producing bytes.
 - Readers reject truncated payloads, oversized arrays, unsupported tags, and
-  trailing bytes where a complete object parser is expected.
-- Data structures use Rust naming and strong types instead of mirroring legacy
+  trailing bytes where whole-object parsing is expected.
+- Data structures use Rust naming and strong types instead of mirroring C#/Python
   class names or nullable dynamic maps.
 - Python names like `PhantasmaRPC`, `ModuleID`, and `ABIParameterResult` map to
   Rust names like `PhantasmaRpc`, `ModuleId`, and `AbiParameterResult`.
@@ -43,16 +42,16 @@ where those SDKs expose the same surface.
 
 ## Test Sources
 
-- `tests/fixtures/carbon_vectors.tsv` is copied from the Python SDK rewrite and
+- `tests/fixtures/carbon_vectors.tsv` is copied from the Python SDK fixture set and
   covers shared Carbon vectors, including non-canonical read cases that must
   match the reference behavior.
-- `tests/binary_transaction_vm.rs` covers classic wire formats and script output.
+- `tests/binary_transaction_vm.rs` covers VM wire formats and script output.
 - `tests/encoding_crypto.rs` covers WIF/address/signature/hash behavior.
 - `tests/carbon_builders.rs` covers higher-level Carbon builders and result
   parsers, including Python metadata validation behavior for required fields,
   case-sensitive schema names, ROM bytes, fixed bytes, unsigned-to-signed
   integer coercion, and array-of-struct metadata.
-- `tests/carbon_python_parity.rs` covers Python rewrite parity for Carbon token,
+- `tests/carbon_python_parity.rs` covers Python SDK parity for Carbon token,
   market, config, parsed schema JSON plus schema builders, and deterministic
   Phantasma NFT helper paths.
 - `tests/rpc.rs` covers JSON-RPC request/response behavior through a mock

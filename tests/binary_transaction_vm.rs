@@ -1,5 +1,5 @@
 use num_bigint::BigInt;
-use phantasma_sdk::vm::VMType as ClassicVMType;
+use phantasma_sdk::vm::VMType as FixtureVMType;
 use phantasma_sdk::{
     big_int_to_vm_bytes, vm_bytes_to_big_int, Address, BinaryReader, BinaryWriter, Opcode,
     PhantasmaKeys, ScriptArg, ScriptBuilder, Transaction, VMObject, SDK_PAYLOAD, SDK_VERSION,
@@ -19,7 +19,7 @@ const SCRIPT_BUILDER_FIXTURE_SHA256: &str =
     "81907a6b1df095b84599d8f8d709623e20dadeca2082ab9dffef114c7d0015e0";
 
 fn script_vector_rows() -> Vec<(String, String, String, String)> {
-    std::fs::read_to_string("tests/fixtures/classic_script_builder_vectors.tsv")
+    std::fs::read_to_string("tests/fixtures/vm_script_builder_vectors.tsv")
         .unwrap()
         .lines()
         .filter(|line| !line.is_empty() && !line.starts_with("case_id\t"))
@@ -107,7 +107,7 @@ fn script_builder_vector(case_id: &str) -> String {
 
 #[test]
 fn script_builder_fixture_hash_is_locked() {
-    let data = std::fs::read("tests/fixtures/classic_script_builder_vectors.tsv").unwrap();
+    let data = std::fs::read("tests/fixtures/vm_script_builder_vectors.tsv").unwrap();
     assert_eq!(
         hex::encode(Sha256::digest(data)),
         SCRIPT_BUILDER_FIXTURE_SHA256
@@ -124,7 +124,7 @@ fn script_builder_matches_golden_vectors() {
 
 #[test]
 fn default_sdk_payload_matches_crate_version() {
-    // The classic transaction default payload is visible on-chain, so it must
+    // The VM script transaction default payload is visible on-chain, so it must
     // move with the crate version instead of retaining a stale release string.
     assert_eq!(SDK_PAYLOAD, format!("RS-SDK-v{SDK_VERSION}").as_bytes());
 }
@@ -162,7 +162,7 @@ fn binary_reader_bounds_fail_closed() {
 
 #[test]
 fn vm_big_integer_edges_round_trip() {
-    // Classic VM BigInteger storage must preserve sign through the padded VM
+    // VM BigInteger storage must preserve sign through the padded VM
     // byte shape, not merely through a script-local LOAD round-trip.
     for value in [
         0i64,
@@ -214,7 +214,7 @@ fn vm_big_integer_matches_gen2_csharp_binary_fixtures() {
             "{case_id} WriteBigInteger"
         );
 
-        let mut object_bytes = vec![ClassicVMType::Number as u8];
+        let mut object_bytes = vec![FixtureVMType::Number as u8];
         object_bytes.extend_from_slice(writer.bytes());
         assert_eq!(
             VMObject::from_bytes(&object_bytes)
@@ -541,7 +541,7 @@ fn script_builder_reports_and_rejects_invalid_operations() {
     assert!(builder.emit_call("done", 0).end_script().is_err());
     let mut builder = ScriptBuilder::begin();
     assert!(builder
-        .emit_load(0, vec![0u8; 0x10000], ClassicVMType::Bytes)
+        .emit_load(0, vec![0u8; 0x10000], FixtureVMType::Bytes)
         .end_script()
         .is_err());
     let mut builder = ScriptBuilder::begin();
@@ -612,8 +612,8 @@ fn vm_object_rejects_invalid_or_incompatible_values() {
 }
 
 #[test]
-fn classic_transaction_signing_round_trip_and_pow() {
-    // Classic transaction bytes are the signing payload for VM script broadcasts.
+fn vm_script_transaction_signing_round_trip_and_pow() {
+    // VM script transaction bytes are the signing payload for VM script broadcasts.
     let keys =
         PhantasmaKeys::from_wif("KxMn2TgXukYaNXx7tEdjh7qB2YaMgeuKy47j4rvKigHhBuZWeP3r").unwrap();
     let mut script = ScriptBuilder::begin();

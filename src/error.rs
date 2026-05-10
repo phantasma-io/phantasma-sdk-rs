@@ -1,7 +1,7 @@
 //! SDK-wide error model.
 //!
-//! The Python SDK exposes several exception subclasses; Rust collapses those
-//! into one enum so callers can use idiomatic `Result<T, PhantasmaError>` while
+//! The Python SDK exposes several exception subclasses; Rust maps those failures
+//! into one enum so callers can use `Result<T, PhantasmaError>` while
 //! still distinguishing encoding, serialization, crypto, builder, RPC, HTTP,
 //! and JSON failures.
 

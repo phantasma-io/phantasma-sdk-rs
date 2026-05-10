@@ -1,4 +1,4 @@
-//! Classic VM transaction building, signing, parsing, and local PoW helpers.
+//! VM script transaction building, signing, parsing, and local PoW helpers.
 
 use num_bigint::BigInt;
 
@@ -6,11 +6,11 @@ use crate::binary::{BinaryReader, BinaryWriter, MAX_ARRAY_SIZE};
 use crate::crypto::{Ed25519Signature, Hash, PhantasmaKeys, SignatureKind};
 use crate::error::{serialization, Result};
 
-/// Default payload for newly built classic transactions.
+/// Default payload for newly built VM script transactions.
 ///
 /// The string is visible in signed transaction bytes, so tests keep it aligned
 /// with the crate version declared in `Cargo.toml`.
-pub const SDK_PAYLOAD: &[u8] = b"RS-SDK-v1.0.0";
+pub const SDK_PAYLOAD: &[u8] = b"RS-SDK-v1.0.1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {

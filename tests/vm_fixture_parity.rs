@@ -1,5 +1,5 @@
 use num_bigint::BigInt;
-use phantasma_sdk::vm::VMType as ClassicVMType;
+use phantasma_sdk::vm::VMType as FixtureVMType;
 use phantasma_sdk::{
     big_int_to_vm_bytes, vm_bytes_to_big_int, BinaryWriter, ScriptBuilder, VMObject,
 };
@@ -127,7 +127,7 @@ fn phantasma_bigint_vectors_match_vm_writer_and_script_builder() {
         assert_eq!(script[1], 0, "LOAD register {}", parts[0]);
         assert_eq!(
             script[2],
-            ClassicVMType::Number as u8,
+            FixtureVMType::Number as u8,
             "LOAD type {}",
             parts[0]
         );
@@ -285,7 +285,7 @@ fn vmobject_cast_struct_matches_gen2_csharp_fixtures() {
     for parts in fixture_rows("tests/fixtures/gen2_csharp_vmobject_cast_struct.tsv") {
         let case_id = &parts[0];
         let object = object_from_fixture(&parts[1], &parts[3]);
-        let result = object.cast_to(ClassicVMType::Struct);
+        let result = object.cast_to(FixtureVMType::Struct);
         if parts[4] == "ok" {
             let result = result.unwrap();
             assert_eq!(format!("{:?}", result.vm_type()), parts[5], "{case_id}");
@@ -301,7 +301,7 @@ fn vmobject_cast_to_common_targets_matches_gen2_conversion_fixtures() {
     for parts in fixture_rows("tests/fixtures/gen2_csharp_vmobject_asstring.tsv") {
         let case_id = &parts[0];
         let object = object_from_fixture(&parts[1], &parts[3]);
-        let result = object.cast_to(ClassicVMType::String);
+        let result = object.cast_to(FixtureVMType::String);
         if parts[4] == "ok" {
             assert_eq!(
                 result.unwrap(),
@@ -316,7 +316,7 @@ fn vmobject_cast_to_common_targets_matches_gen2_conversion_fixtures() {
     for parts in fixture_rows("tests/fixtures/gen2_csharp_vmobject_asbytes.tsv") {
         let case_id = &parts[0];
         let object = object_from_fixture(&parts[1], &parts[3]);
-        let result = object.cast_to(ClassicVMType::Bytes);
+        let result = object.cast_to(FixtureVMType::Bytes);
         if parts[4] == "ok" {
             assert_eq!(
                 result.unwrap(),
@@ -331,7 +331,7 @@ fn vmobject_cast_to_common_targets_matches_gen2_conversion_fixtures() {
     for parts in fixture_rows("tests/fixtures/gen2_csharp_vmobject_asnumber.tsv") {
         let case_id = &parts[0];
         let object = object_from_fixture(&parts[1], &parts[3]);
-        let result = object.cast_to(ClassicVMType::Number);
+        let result = object.cast_to(FixtureVMType::Number);
         if parts[4] == "ok" {
             assert_eq!(
                 result.unwrap(),
@@ -346,7 +346,7 @@ fn vmobject_cast_to_common_targets_matches_gen2_conversion_fixtures() {
     for parts in fixture_rows("tests/fixtures/gen2_csharp_vmobject_asbool.tsv") {
         let case_id = &parts[0];
         let object = object_from_fixture(&parts[1], &parts[3]);
-        let result = object.cast_to(ClassicVMType::Bool);
+        let result = object.cast_to(FixtureVMType::Bool);
         if parts[4] == "ok" {
             assert_eq!(
                 result.unwrap(),

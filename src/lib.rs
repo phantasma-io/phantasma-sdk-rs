@@ -1,9 +1,9 @@
-//! Idiomatic Rust SDK for Phantasma.
+//! Rust SDK for the Phantasma blockchain with support for the Phoenix chain update.
 //!
-//! The crate exposes checked primitives for classic VM scripts, classic
-//! transactions, Gen3 Carbon payloads, Ed25519 keys, and JSON-RPC access. Public
-//! APIs return `Result` instead of panicking on malformed user input or hostile
-//! external data.
+//! The crate exposes checked primitives for transaction building and signing,
+//! VM scripts, VM script transactions, Carbon payloads, Ed25519 keys, and
+//! JSON-RPC access. Public APIs return `Result` instead of panicking on
+//! malformed user input or hostile external data.
 
 pub mod binary;
 pub mod carbon;

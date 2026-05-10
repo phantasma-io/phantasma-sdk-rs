@@ -1,6 +1,6 @@
-//! Classic VM binary primitives.
+//! VM binary primitives.
 //!
-//! This module intentionally keeps classic VM serialization separate from
+//! This module intentionally keeps VM serialization separate from
 //! Carbon serialization. The two formats share some concepts but not enough
 //! byte-level rules to safely reuse one reader/writer for both.
 

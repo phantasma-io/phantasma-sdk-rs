@@ -1,6 +1,6 @@
 [package]
 name = "phantasma-sdk"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 rust-version = "1.74"
 authors = ["Phantasma contributors"]
@@ -10,7 +10,7 @@ repository = "https://github.com/phantasma-io/phantasma-sdk-rs"
 homepage = "https://phantasma.io"
 keywords = ["phantasma", "blockchain", "sdk", "carbon"]
 categories = ["api-bindings", "cryptography::cryptocurrencies", "encoding"]
-description = "Idiomatic Rust SDK for Phantasma Gen3 Carbon and classic VM transactions"
+description = "Rust SDK for the Phantasma blockchain with support for the Phoenix chain update"
 
 [lib]
 name = "phantasma_sdk"

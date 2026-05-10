@@ -45,7 +45,7 @@ fn signature_verifies_against_derived_address() {
 
 #[test]
 fn hash_difficulty_matches_phantasma_little_endian_pow() {
-    // Classic PoW uses the validator/Go/TS little-endian hash convention.
+    // VM transaction PoW uses the validator/Go/TS little-endian hash convention.
     assert_eq!(Hash::new([0xFF; 32]).difficulty(), 0);
     let mut high = [0xFF; 32];
     high[31] = 0;

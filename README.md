@@ -1,19 +1,20 @@
 # Phantasma Rust SDK
 
-This repository contains the Rust SDK for Phantasma Gen3 Carbon and the classic
-VM transaction surface. The crate was rewritten as a native Rust library rather
-than a compatibility wrapper around the previous SDK shape.
+Rust SDK for the Phantasma blockchain with support for the Phoenix chain update.
+
+The crate provides transaction building and signing, VM script helpers, Ed25519
+keys/signatures, JSON-RPC access, and Carbon wire-format support.
 
 The public API is organized around checked primitives:
 
 - `crypto`: Ed25519 keys, WIF, Phantasma addresses, hashes, signatures.
-- `binary`: classic VM binary readers and writers.
+- `binary`: VM binary readers and writers.
 - `vm`: script building and VM object parsing.
-- `transaction`: classic signed transactions and proof-of-work helpers.
-- `carbon`: Gen3 Carbon wire formats, token/NFT schemas, signed Carbon tx
+- `transaction`: VM script transactions and proof-of-work helpers.
+- `carbon`: Carbon wire formats, token/NFT schemas, signed Carbon transaction
   messages, and builder helpers.
 - `rpc`: async JSON-RPC client, response models, state helpers, and send
-  helpers for classic and Carbon transactions.
+  helpers for VM script and Carbon transactions.
 
 All fallible APIs return `phantasma_sdk::Result<T>`. Public parsing code rejects
 malformed input with explicit errors instead of panicking.
@@ -22,7 +23,7 @@ malformed input with explicit errors instead of panicking.
 
 ```toml
 [dependencies]
-phantasma-sdk = { path = "." }
+phantasma-sdk = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -40,7 +41,7 @@ async fn main() -> Result<()> {
 }
 ```
 
-## Offline Classic Transaction
+## Offline VM Script Transaction
 
 ```rust
 use phantasma_sdk::{Address, PhantasmaKeys, Result, ScriptBuilder, Transaction, encode_hex};
@@ -105,10 +106,11 @@ just verify
 ```
 
 That runs formatting checks, all-target compilation, unit tests, Clippy with
-warnings denied, and docs with rustdoc warnings denied. `cargo package
---allow-dirty` is also useful before publishing or reviewing package contents.
+warnings denied, and docs with rustdoc warnings denied. Use `just release-check`
+before publishing; it also verifies strict package creation and runs
+`cargo publish --dry-run`.
 
-The test suite includes cross-SDK vectors copied from the Python SDK rewrite,
-including Carbon primitives, `IntX`, VM structs, Carbon transactions, classic
-VM scripts, WIF/address/signature behavior, RPC request parsing, and hostile
+The test suite includes cross-SDK vectors copied from the Python SDK fixture set,
+including Carbon primitives, `IntX`, VM structs, Carbon transactions, VM
+scripts, WIF/address/signature behavior, RPC request parsing, and hostile
 input rejection paths.
