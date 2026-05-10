@@ -18,7 +18,23 @@ clippy:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
-package:
+package-dirty:
     cargo package --allow-dirty
 
+package:
+    cargo package
+
 verify: fmt-check check test clippy doc
+
+release-check:
+    test -z "$(git status --porcelain)" || (git status --short && false)
+    just verify
+    cargo package
+    cargo publish --dry-run
+
+publish-dry-run:
+    just release-check
+
+publish:
+    just release-check
+    cargo publish
