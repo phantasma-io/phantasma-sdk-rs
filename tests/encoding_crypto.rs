@@ -2,6 +2,10 @@ use phantasma_sdk::{
     decode_base58, encode_base58, Address, AddressKind, Ed25519Signature, Hash, PhantasmaError,
     PhantasmaKeys,
 };
+use sha2::{Digest, Sha256};
+
+const ED25519_VECTORS_SHA256: &str =
+    "dd747f5c49b49a67f1c63d02351be669558bf9da65571ed7311bcd8cf8d2bd01";
 
 #[test]
 fn base58_round_trip_preserves_leading_zeroes() {
@@ -41,6 +45,64 @@ fn signature_verifies_against_derived_address() {
     let signature = keys.sign(message);
     assert!(signature.verify(message, [&keys.address()]));
     assert!(!signature.verify(b"bad", [&keys.address()]));
+}
+
+#[test]
+fn ed25519_matches_shared_golden_vectors() {
+    let data = std::fs::read("tests/fixtures/ed25519_vectors.tsv").unwrap();
+    let digest = Sha256::digest(&data);
+    assert_eq!(hex::encode(digest), ED25519_VECTORS_SHA256);
+
+    let text = std::str::from_utf8(&data).unwrap();
+    let mut rows = 0usize;
+    for line in text
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .skip(1)
+    {
+        let parts: Vec<&str> = line.split('\t').collect();
+        assert_eq!(parts.len(), 7, "malformed Ed25519 vector row: {line}");
+
+        let case_id = parts[0];
+        let seed = hex::decode(parts[2]).unwrap();
+        let public_key = hex::decode(parts[3]).unwrap();
+        let message = hex::decode(parts[4]).unwrap();
+        let signature = hex::decode(parts[5]).unwrap();
+
+        let keys = PhantasmaKeys::try_from_slice(&seed).unwrap();
+        assert_eq!(
+            keys.public_key().as_slice(),
+            public_key.as_slice(),
+            "{case_id}"
+        );
+
+        let sdk_signature = keys.sign(&message);
+        assert_eq!(
+            sdk_signature.data().as_slice(),
+            signature.as_slice(),
+            "{case_id}"
+        );
+
+        let expected_signature = Ed25519Signature::try_from_slice(&signature).unwrap();
+        assert!(
+            expected_signature.verify(&message, [&keys.address()]),
+            "{case_id}"
+        );
+
+        let mut bad_message = if message.is_empty() {
+            vec![0]
+        } else {
+            message.clone()
+        };
+        bad_message[0] ^= 0xff;
+        assert!(
+            !expected_signature.verify(&bad_message, [&keys.address()]),
+            "{case_id}"
+        );
+
+        rows += 1;
+    }
+    assert!(rows > 0, "Ed25519 fixture did not contain data rows");
 }
 
 #[test]
