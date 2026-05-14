@@ -10,7 +10,7 @@ use crate::error::{serialization, Result};
 ///
 /// The string is visible in signed transaction bytes, so tests keep it aligned
 /// with the crate version declared in `Cargo.toml`.
-pub const SDK_PAYLOAD: &[u8] = b"RS-SDK-v1.0.1";
+pub const SDK_PAYLOAD: &[u8] = b"RS-SDK-v1.0.2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {

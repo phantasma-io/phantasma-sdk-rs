@@ -1,11 +1,12 @@
 use num_bigint::BigInt;
 use phantasma_sdk::{
     build_and_serialize_token_schemas, build_mint_phantasma_non_fungible_single_tx,
-    build_token_schemas_from_fields, default_market_config, deserialize, parse_token_schemas_json,
-    serialize, serialize_token_schemas, serialize_token_schemas_hex, token_schemas_from_json,
-    vm_type_from_string, vm_type_name, BurnFungibleArgs, BurnNonFungibleArgs, Bytes32, ChainConfig,
-    CreateMintedTokenSeriesArgs, CreateSeriesFeeOptions, CreateTokenSeriesArgs, GasConfig, IntX,
-    MarketConfig, MarketConfigFlags, MarketSellTokenByIdArgs, MintFungibleArgs, MintNFTFeeOptions,
+    build_mint_phantasma_non_fungible_tx, build_token_schemas_from_fields, default_market_config,
+    deserialize, parse_token_schemas_json, serialize, serialize_token_schemas,
+    serialize_token_schemas_hex, token_schemas_from_json, vm_type_from_string, vm_type_name,
+    BurnFungibleArgs, BurnNonFungibleArgs, Bytes32, ChainConfig, CreateMintedTokenSeriesArgs,
+    CreateSeriesFeeOptions, CreateTokenSeriesArgs, GasConfig, IntX, MarketConfig,
+    MarketConfigFlags, MarketSellTokenByIdArgs, MintFungibleArgs, MintNFTFeeOptions,
     MintPhantasmaNonFungibleArgs, ModuleId, PhantasmaNFTMintInfo, PhantasmaNFTMintResult,
     SeriesInfo, SmallString, TokenContractMethod, TokenListing, TokenSchemaField, TokensConfig,
     TokensConfigFlags, TransferFungibleArgs, TransferNonFungibleArgs, TxMsgCall, TxPayload, TxType,
@@ -390,4 +391,62 @@ fn phantasma_nft_tx_helper_uses_call_payload_and_fee_defaults() {
     assert_eq!(decoded.address, receiver);
     assert!(CreateSeriesFeeOptions::default().calculate_max_gas() > 0);
     assert!(MintNFTFeeOptions::default().calculate_max_gas() > 0);
+}
+
+#[test]
+fn fee_options_scale_only_count_sensitive_mint_fees() {
+    let mint_fees = MintNFTFeeOptions {
+        gas_fee_base: 10,
+        fee_multiplier: 1_000,
+    };
+    assert_eq!(mint_fees.calculate_max_gas(), 10_000);
+    assert_eq!(mint_fees.calculate_max_gas_for_count(3).unwrap(), 30_000);
+    assert!(mint_fees.calculate_max_gas_for_count(0).is_err());
+
+    let series_fees = CreateSeriesFeeOptions {
+        gas_fee_base: 10,
+        fee_multiplier: 30,
+        gas_fee_create_series_base: 20,
+    };
+    assert_eq!(series_fees.calculate_max_gas(), 900);
+
+    let sender = repeated_bytes32(0x11);
+    let receiver = repeated_bytes32(0x22);
+    let tx = build_mint_phantasma_non_fungible_tx(
+        42,
+        sender,
+        receiver,
+        vec![
+            PhantasmaNFTMintInfo {
+                phantasma_series_id: IntX(BigInt::from(1u32)),
+                rom: vec![0x01],
+                ram: vec![],
+            },
+            PhantasmaNFTMintInfo {
+                phantasma_series_id: IntX(BigInt::from(2u32)),
+                rom: vec![0x02],
+                ram: vec![],
+            },
+            PhantasmaNFTMintInfo {
+                phantasma_series_id: IntX(BigInt::from(3u32)),
+                rom: vec![0x03],
+                ram: vec![],
+            },
+        ],
+        Some(mint_fees),
+        123,
+        999,
+    )
+    .unwrap();
+    assert_eq!(tx.max_gas, 30_000);
+    assert!(build_mint_phantasma_non_fungible_tx(
+        42,
+        sender,
+        receiver,
+        vec![],
+        Some(MintNFTFeeOptions::default()),
+        123,
+        999,
+    )
+    .is_err());
 }

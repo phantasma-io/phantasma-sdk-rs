@@ -3236,6 +3236,21 @@ impl FeeOptions {
     pub fn calculate_max_gas(&self) -> u64 {
         self.gas_fee_base * self.fee_multiplier
     }
+
+    pub fn calculate_max_gas_for_count(&self, count: u64) -> Result<u64> {
+        if count == 0 {
+            return builder("FeeOptions::calculate_max_gas_for_count count must be positive");
+        }
+        let base = self
+            .gas_fee_base
+            .checked_mul(self.fee_multiplier)
+            .ok_or_else(|| {
+                PhantasmaError::Builder("FeeOptions::calculate_max_gas_for_count overflow".into())
+            })?;
+        base.checked_mul(count).ok_or_else(|| {
+            PhantasmaError::Builder("FeeOptions::calculate_max_gas_for_count overflow".into())
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3867,6 +3882,10 @@ pub fn build_mint_phantasma_non_fungible_tx(
     expiry: i64,
 ) -> Result<TxMsg> {
     let fees = fees.unwrap_or_default();
+    let max_gas =
+        fees.calculate_max_gas_for_count(u64::try_from(tokens.len()).map_err(|_| {
+            PhantasmaError::Builder("MintPhantasmaNonFungible token count overflow".into())
+        })?)?;
     let args = MintPhantasmaNonFungibleArgs {
         token_id,
         address: receiver,
@@ -3879,7 +3898,7 @@ pub fn build_mint_phantasma_non_fungible_tx(
         } else {
             expiry
         },
-        max_gas: fees.calculate_max_gas(),
+        max_gas,
         max_data,
         gas_from: sender,
         payload: SmallString::default(),
