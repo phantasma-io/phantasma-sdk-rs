@@ -106,6 +106,128 @@ async fn send_raw_transaction_accepts_hash_object_results() {
 }
 
 #[tokio::test]
+async fn typed_raw_block_call_preserves_sdk_value_and_response_metadata() {
+    // Indexers need the typed block for normalization and the raw JSON-RPC
+    // result/envelope for archival and parity checks.
+    let block = json!({
+        "hash": "ABCD",
+        "previousHash": "PREV",
+        "height": 42,
+        "timestamp": 1000,
+        "chainAddress": "PCHAIN",
+        "protocol": 18,
+        "validatorAddress": "PVALIDATOR",
+        "reward": "0",
+        "txs": [{
+            "hash": "TX1",
+            "chainAddress": "PCHAIN",
+            "timestamp": 1000,
+            "blockHeight": 42,
+            "blockHash": "ABCD",
+            "script": "CAFE",
+            "payload": "504159",
+            "events": [{
+                "address": "PADDR",
+                "contract": "gas",
+                "kind": "GasEscrow",
+                "name": "GasEscrow",
+                "data": "00"
+            }],
+            "state": "Halt",
+            "result": "",
+            "fee": "467",
+            "signatures": [{"kind": "Ed25519", "data": "SIG"}],
+            "sender": "PSENDER",
+            "expiration": 1234
+        }]
+    });
+    let transport = MockTransport::with_response((
+        200,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "0",
+            "result": block
+        }),
+    ));
+    let client = PhantasmaRpc::with_transport("http://localhost:5172/rpc", transport.clone());
+
+    let result = client
+        .get_block_by_height_with_raw("main", 42)
+        .await
+        .unwrap();
+
+    assert_eq!(result.value.hash, "ABCD");
+    assert_eq!(result.value.txs[0].hash, "TX1");
+    assert_eq!(result.value.txs[0].payload, "504159");
+    assert_eq!(result.raw_result["hash"], "ABCD");
+    assert_eq!(result.raw_result["txs"][0]["sender"], "PSENDER");
+    assert_eq!(
+        result.raw_result["txs"][0]["events"][0]["name"],
+        "GasEscrow"
+    );
+    assert_eq!(result.raw_envelope["result"]["hash"], "ABCD");
+    assert_eq!(result.endpoint, "http://localhost:5172/rpc");
+    assert_eq!(result.method, "getBlockByHeight");
+    assert_eq!(result.http_status, 200);
+    assert!(result.canonical_result_bytes > 0);
+    assert!(result.canonical_envelope_bytes > 0);
+
+    let requests = transport.requests();
+    assert_eq!(requests[0]["method"], "getBlockByHeight");
+    assert_eq!(requests[0]["params"], json!(["main", 42]));
+}
+
+#[tokio::test]
+async fn typed_raw_block_height_call_preserves_scalar_result_shape() {
+    // Block height can arrive as a string from current nodes; the typed value
+    // should be coerced while the raw result keeps the original shape.
+    let transport = MockTransport::with_response((
+        200,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "0",
+            "result": "123"
+        }),
+    ));
+    let client = PhantasmaRpc::with_transport("http://localhost:5172/rpc", transport.clone());
+
+    let result = client.get_block_height_with_raw("main").await.unwrap();
+
+    assert_eq!(result.value, 123);
+    assert_eq!(result.raw_result, json!("123"));
+    assert_eq!(result.method, "getBlockHeight");
+    assert_eq!(result.http_status, 200);
+}
+
+#[tokio::test]
+async fn typed_raw_transaction_by_block_call_preserves_sdk_parameter_order() {
+    // Explorer can hydrate missing transaction details without duplicating the
+    // SDK's JSON-RPC method name or its historical parameter order.
+    let transport = MockTransport::with_response((
+        200,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "0",
+            "result": {"hash": "TX1", "state": "Success"}
+        }),
+    ));
+    let client = PhantasmaRpc::with_transport("http://localhost:5172/rpc", transport.clone());
+
+    let result = client
+        .get_transaction_by_block_hash_and_index_with_raw("BLOCK", 3, "main")
+        .await
+        .unwrap();
+
+    assert_eq!(result.value.hash, "TX1");
+    assert_eq!(result.raw_result["hash"], "TX1");
+    assert_eq!(result.method, "getTransactionByBlockHashAndIndex");
+
+    let requests = transport.requests();
+    assert_eq!(requests[0]["method"], "getTransactionByBlockHashAndIndex");
+    assert_eq!(requests[0]["params"], json!(["main", "BLOCK", 3]));
+}
+
+#[tokio::test]
 async fn rpc_alias_methods_preserve_python_parameter_order() {
     fn ok(result: Value) -> (u16, Value) {
         (200, json!({"jsonrpc": "2.0", "id": "0", "result": result}))

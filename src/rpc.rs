@@ -73,6 +73,44 @@ pub struct PhantasmaRpc<T = ReqwestTransport> {
     transport: T,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RpcCallResult<T> {
+    /// Typed SDK model decoded from the JSON-RPC `result` field.
+    pub value: T,
+    /// Exact parsed JSON value from the JSON-RPC `result` field.
+    pub raw_result: Value,
+    /// Parsed full JSON-RPC response envelope returned by the transport.
+    pub raw_envelope: Value,
+    /// Endpoint used for this request.
+    pub endpoint: String,
+    /// JSON-RPC method name used for this request.
+    pub method: String,
+    /// HTTP status reported by the transport.
+    pub http_status: u16,
+    /// Byte length of the parsed JSON-RPC `result` after canonical JSON
+    /// serialization. This is not the original byte-for-byte HTTP body length.
+    pub canonical_result_bytes: usize,
+    /// Byte length of the parsed response envelope after canonical JSON
+    /// serialization. This is not the original byte-for-byte HTTP body length.
+    pub canonical_envelope_bytes: usize,
+}
+
+impl<T> RpcCallResult<T> {
+    /// Replaces the typed value while preserving raw response metadata.
+    pub fn map_value<U>(self, value: U) -> RpcCallResult<U> {
+        RpcCallResult {
+            value,
+            raw_result: self.raw_result,
+            raw_envelope: self.raw_envelope,
+            endpoint: self.endpoint,
+            method: self.method,
+            http_status: self.http_status,
+            canonical_result_bytes: self.canonical_result_bytes,
+            canonical_envelope_bytes: self.canonical_envelope_bytes,
+        }
+    }
+}
+
 impl PhantasmaRpc<ReqwestTransport> {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
@@ -105,18 +143,60 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         self
     }
 
+    async fn post_json_rpc(&self, method: &str, params: Vec<Value>) -> Result<(u16, Value)> {
+        self.transport
+            .post_json(
+                &self.endpoint,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "0",
+                    "method": method,
+                    "params": params,
+                }),
+                self.timeout,
+            )
+            .await
+    }
+
+    pub async fn call_value_with_raw(
+        &self,
+        method: &str,
+        params: Vec<Value>,
+    ) -> Result<RpcCallResult<Value>> {
+        let (status, body) = self.post_json_rpc(method, params).await?;
+        let canonical_envelope_bytes = serde_json::to_vec(&body)?.len();
+        let raw_result = parse_json_rpc_response(status, body.clone())?;
+        let canonical_result_bytes = serde_json::to_vec(&raw_result)?.len();
+        Ok(RpcCallResult {
+            value: raw_result.clone(),
+            raw_result,
+            raw_envelope: body,
+            endpoint: self.endpoint.clone(),
+            method: method.to_string(),
+            http_status: status,
+            canonical_result_bytes,
+            canonical_envelope_bytes,
+        })
+    }
+
     pub async fn call_value(&self, method: &str, params: Vec<Value>) -> Result<Value> {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": "0",
-            "method": method,
-            "params": params,
-        });
-        let (status, body) = self
-            .transport
-            .post_json(&self.endpoint, request, self.timeout)
-            .await?;
+        let (status, body) = self.post_json_rpc(method, params).await?;
         parse_json_rpc_response(status, body)
+    }
+
+    pub async fn call_with_raw<R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Vec<Value>,
+    ) -> Result<RpcCallResult<R>> {
+        let response = self.call_value_with_raw(method, params).await?;
+        let value = serde_json::from_value(response.raw_result.clone()).map_err(|err| {
+            PhantasmaError::Rpc {
+                code: None,
+                message: err.to_string(),
+            }
+        })?;
+        Ok(response.map_value(value))
     }
 
     pub async fn call<R: DeserializeOwned>(&self, method: &str, params: Vec<Value>) -> Result<R> {
@@ -249,8 +329,25 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
             .await
     }
 
+    pub async fn get_block_by_height_with_raw(
+        &self,
+        chain: &str,
+        height: u64,
+    ) -> Result<RpcCallResult<BlockResult>> {
+        self.call_with_raw("getBlockByHeight", vec![json!(chain), json!(height)])
+            .await
+    }
+
     pub async fn get_block_by_hash(&self, hash: &str) -> Result<BlockResult> {
         self.call("getBlockByHash", vec![json!(hash)]).await
+    }
+
+    pub async fn get_block_by_hash_with_raw(
+        &self,
+        hash: &str,
+    ) -> Result<RpcCallResult<BlockResult>> {
+        self.call_with_raw("getBlockByHash", vec![json!(hash)])
+            .await
     }
 
     pub async fn get_block_transaction_count_by_hash_on_chain(
@@ -280,11 +377,27 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         self.call("getLatestBlock", vec![json!(chain)]).await
     }
 
+    pub async fn get_latest_block_with_raw(
+        &self,
+        chain: &str,
+    ) -> Result<RpcCallResult<BlockResult>> {
+        self.call_with_raw("getLatestBlock", vec![json!(chain)])
+            .await
+    }
+
     pub async fn get_block_height(&self, chain: &str) -> Result<u64> {
         coerce_u64(
             self.call_value("getBlockHeight", vec![json!(chain)])
                 .await?,
         )
+    }
+
+    pub async fn get_block_height_with_raw(&self, chain: &str) -> Result<RpcCallResult<u64>> {
+        let response = self
+            .call_value_with_raw("getBlockHeight", vec![json!(chain)])
+            .await?;
+        let value = coerce_u64(response.raw_result.clone())?;
+        Ok(response.map_value(value))
     }
 
     pub async fn get_transaction_by_block_hash_and_index(
@@ -294,6 +407,19 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         chain: &str,
     ) -> Result<TransactionResult> {
         self.call(
+            "getTransactionByBlockHashAndIndex",
+            vec![json!(chain), json!(block_hash), json!(index)],
+        )
+        .await
+    }
+
+    pub async fn get_transaction_by_block_hash_and_index_with_raw(
+        &self,
+        block_hash: &str,
+        index: u32,
+        chain: &str,
+    ) -> Result<RpcCallResult<TransactionResult>> {
+        self.call_with_raw(
             "getTransactionByBlockHashAndIndex",
             vec![json!(chain), json!(block_hash), json!(index)],
         )
@@ -312,6 +438,14 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
 
     pub async fn get_transaction(&self, hash: &str) -> Result<TransactionResult> {
         self.call("getTransaction", vec![json!(hash)]).await
+    }
+
+    pub async fn get_transaction_with_raw(
+        &self,
+        hash: &str,
+    ) -> Result<RpcCallResult<TransactionResult>> {
+        self.call_with_raw("getTransaction", vec![json!(hash)])
+            .await
     }
 
     pub async fn get_contract(&self, contract_name: &str, chain: &str) -> Result<ContractResult> {

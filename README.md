@@ -41,6 +41,14 @@ async fn main() -> Result<()> {
 }
 ```
 
+Indexers that need both typed models and archival/parity payloads can use the
+`*_with_raw` helpers:
+
+```rust
+let response = rpc.get_block_by_height_with_raw("main", 123).await?;
+println!("{} {}", response.value.hash, response.raw_result);
+```
+
 ## Offline VM Script Transaction
 
 ```rust
