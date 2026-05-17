@@ -1282,7 +1282,7 @@ pub struct BalanceResult {
     pub amount: String,
     pub symbol: String,
     pub decimals: u32,
-    pub ids: Vec<String>,
+    pub ids: Option<Vec<String>>,
 }
 
 impl BalanceResult {
@@ -1325,14 +1325,14 @@ impl StakeResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ArchiveResult {
-    pub hash: String,
-    pub name: String,
+    pub hash: Option<String>,
+    pub name: Option<String>,
     pub size: u64,
     pub time: u64,
-    pub encryption: String,
+    pub encryption: Option<String>,
     pub block_count: u64,
-    pub missing_blocks: Vec<u64>,
-    pub owners: Vec<String>,
+    pub missing_blocks: Option<Vec<u64>>,
+    pub owners: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1352,10 +1352,11 @@ pub struct AccountResult {
     pub stakes: StakeResult,
     pub stake: String,
     pub unclaimed: String,
-    pub relay: String,
+    pub relay: Option<String>,
     pub validator: String,
     pub storage: StorageResult,
     pub balances: Vec<BalanceResult>,
+    pub txs: Option<Vec<String>>,
 }
 
 impl AccountResult {
@@ -1378,7 +1379,7 @@ impl AccountResult {
             amount: "0".to_string(),
             symbol: symbol.to_string(),
             decimals,
-            ids: Vec::new(),
+            ids: None,
         });
         self.balances.last().expect("balance was just inserted")
     }
@@ -1405,7 +1406,7 @@ pub struct PaginatedResult<T> {
 #[serde(default, rename_all = "camelCase")]
 pub struct CursorPaginatedResult<T> {
     pub result: Option<T>,
-    pub cursor: String,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1414,7 +1415,17 @@ pub struct EventResult {
     pub address: String,
     pub contract: String,
     pub kind: String,
+    pub name: String,
     pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct EventExResult {
+    pub address: String,
+    pub contract: String,
+    pub kind: String,
+    pub data: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1440,12 +1451,21 @@ pub struct TransactionResult {
     pub block_height: u64,
     pub block_hash: String,
     pub script: String,
+    pub carbon_tx_type: u32,
+    pub carbon_tx_data: String,
     pub payload: String,
     pub events: Vec<EventResult>,
+    pub extended_events: Vec<EventExResult>,
     pub state: String,
     pub result: String,
+    pub debug_comment: Option<String>,
     pub fee: String,
     pub signatures: Vec<SignatureResult>,
+    pub sender: String,
+    pub gas_payer: String,
+    pub gas_target: String,
+    pub gas_price: String,
+    pub gas_limit: String,
     pub expiration: u64,
 }
 
@@ -1471,8 +1491,8 @@ pub struct BlockResult {
     pub txs: Vec<TransactionResult>,
     pub validator_address: String,
     pub reward: String,
-    pub events: Vec<EventResult>,
-    pub oracles: Vec<OracleResult>,
+    pub events: Option<Vec<EventResult>>,
+    pub oracles: Option<Vec<OracleResult>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1480,9 +1500,10 @@ pub struct BlockResult {
 pub struct ContractResult {
     pub name: String,
     pub address: String,
+    pub owner: Option<String>,
     pub script: String,
-    pub methods: Vec<AbiMethodResult>,
-    pub events: Vec<AbiEventResult>,
+    pub methods: Option<Vec<AbiMethodResult>>,
+    pub events: Option<Vec<AbiEventResult>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1520,9 +1541,9 @@ pub struct GovernanceResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct OrganizationResult {
-    pub id: String,
-    pub name: String,
-    pub members: Vec<String>,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub members: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1546,13 +1567,13 @@ pub struct CrowdsaleResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ChainResult {
-    pub name: String,
-    pub address: String,
-    pub parent: String,
+    pub name: Option<String>,
+    pub address: Option<String>,
+    pub parent: Option<String>,
     pub height: u64,
-    pub organization: String,
-    pub contracts: Vec<String>,
-    pub dapps: Vec<String>,
+    pub organization: Option<String>,
+    pub contracts: Option<Vec<String>>,
+    pub dapps: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1566,13 +1587,13 @@ pub struct DappResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct NexusResult {
-    pub name: String,
+    pub name: Option<String>,
     pub protocol: u32,
-    pub platforms: Vec<PlatformResult>,
-    pub tokens: Vec<TokenResult>,
-    pub chains: Vec<ChainResult>,
-    pub governance: Vec<GovernanceResult>,
-    pub organizations: Vec<String>,
+    pub platforms: Option<Vec<PlatformResult>>,
+    pub tokens: Option<Vec<TokenResult>>,
+    pub chains: Option<Vec<ChainResult>>,
+    pub governance: Option<Vec<GovernanceResult>>,
+    pub organizations: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1585,16 +1606,14 @@ pub struct LeaderboardRowResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LeaderboardResult {
-    pub name: String,
-    pub rows: Vec<LeaderboardRowResult>,
+    pub name: Option<String>,
+    pub rows: Option<Vec<LeaderboardRowResult>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct TokenPropertyResult {
-    #[serde(alias = "Key")]
     pub key: String,
-    #[serde(alias = "Value")]
     pub value: String,
 }
 
@@ -1656,10 +1675,10 @@ pub struct TokenSeriesResult {
     pub mint_count: String,
     pub current_supply: String,
     pub max_supply: String,
-    pub burned_supply: String,
-    pub mode: String,
-    pub script: String,
-    pub methods: Vec<AbiMethodResult>,
+    pub burned_supply: Option<String>,
+    pub mode: Option<String>,
+    pub script: Option<String>,
+    pub methods: Option<Vec<AbiMethodResult>>,
     pub metadata: Vec<TokenPropertyResult>,
 }
 
@@ -1675,13 +1694,13 @@ pub struct TokenResult {
     pub address: String,
     pub owner: String,
     pub flags: String,
-    pub script: String,
+    pub script: Option<String>,
     pub series: Vec<TokenSeriesResult>,
     pub carbon_id: String,
-    pub metadata: Vec<TokenPropertyResult>,
+    pub metadata: Option<Vec<TokenPropertyResult>>,
     pub token_schemas: Option<TokenSchemasResult>,
-    pub external: Vec<TokenExternalResult>,
-    pub price: Vec<TokenPriceResult>,
+    pub external: Option<Vec<TokenExternalResult>>,
+    pub price: Option<Vec<TokenPriceResult>>,
 }
 
 impl TokenResult {
@@ -1754,13 +1773,18 @@ pub struct TokenDataResult {
 pub struct NftResult {
     pub id: String,
     pub series: String,
+    pub carbon_token_id: String,
+    pub carbon_series_id: String,
+    pub carbon_nft_address: String,
     pub mint: String,
     pub chain_name: String,
     pub owner_address: String,
     pub creator_address: String,
-    pub rom: String,
     pub ram: String,
+    pub rom: String,
     pub status: String,
+    pub infusion: Vec<TokenPropertyResult>,
+    pub properties: Vec<TokenPropertyResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1866,8 +1890,9 @@ pub struct ScriptResult {
     pub result: String,
     pub results: Vec<String>,
     pub oracles: Vec<OracleResult>,
-    pub state: String,
-    pub gas: String,
+    pub error: Option<String>,
+    pub state: Option<String>,
+    pub gas: Option<String>,
 }
 
 impl ScriptResult {
