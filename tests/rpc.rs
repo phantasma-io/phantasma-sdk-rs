@@ -63,13 +63,38 @@ impl RpcTransport for MockTransport {
     }
 }
 
+fn assert_rpc_error_contains<T>(result: phantasma_sdk::Result<T>, expected: &str) {
+    match result {
+        Err(PhantasmaError::Rpc { message, .. }) => {
+            assert!(
+                message.contains(expected),
+                "expected RPC error containing {expected:?}, got {message:?}"
+            );
+        }
+        Err(err) => panic!("expected RPC error containing {expected:?}, got {err:?}"),
+        Ok(_) => panic!("expected RPC error containing {expected:?}, got success"),
+    }
+}
+
+fn assert_rpc_error_message(err: PhantasmaError, expected: &str) {
+    match err {
+        PhantasmaError::Rpc { message, .. } => {
+            assert!(
+                message.contains(expected),
+                "expected RPC error containing {expected:?}, got {message:?}"
+            );
+        }
+        other => panic!("expected RPC error containing {expected:?}, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn rpc_wrapper_builds_json_rpc_request() {
     let transport = MockTransport::with_response((
         200,
         json!({
             "jsonrpc": "2.0",
-            "id": "0",
+            "id": "1",
             "result": {"version": "3.0.0", "commit": "abc123"}
         }),
     ));
@@ -82,9 +107,81 @@ async fn rpc_wrapper_builds_json_rpc_request() {
     let requests = transport.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["jsonrpc"], "2.0");
-    assert_eq!(requests[0]["id"], "0");
+    assert_eq!(requests[0]["id"], 1);
     assert_eq!(requests[0]["method"], "getVersion");
     assert_eq!(requests[0]["params"], json!([]));
+}
+
+#[tokio::test]
+async fn rpc_client_rejects_uncorrelated_response_ids_on_public_call_paths() {
+    let invalid_envelopes = [
+        (
+            "numeric zero",
+            json!({"jsonrpc": "2.0", "id": 0, "result": {"version": "bad", "commit": "bad"}}),
+            "response id mismatch",
+        ),
+        (
+            "string zero",
+            json!({"jsonrpc": "2.0", "id": "0", "result": {"version": "bad", "commit": "bad"}}),
+            "response id mismatch",
+        ),
+        (
+            "wrong string",
+            json!({"jsonrpc": "2.0", "id": "2", "result": {"version": "bad", "commit": "bad"}}),
+            "response id mismatch",
+        ),
+        (
+            "missing",
+            json!({"jsonrpc": "2.0", "result": {"version": "bad", "commit": "bad"}}),
+            "missing id",
+        ),
+        (
+            "null",
+            json!({"jsonrpc": "2.0", "id": null, "result": {"version": "bad", "commit": "bad"}}),
+            "response id mismatch",
+        ),
+        (
+            "object",
+            json!({"jsonrpc": "2.0", "id": {"request": 1}, "result": {"version": "bad", "commit": "bad"}}),
+            "response id mismatch",
+        ),
+    ];
+
+    for (label, envelope, expected_error) in invalid_envelopes {
+        for call_path in ["call_value", "call_with_raw", "call_typed"] {
+            let transport = MockTransport::with_response((200, envelope.clone()));
+            let client =
+                PhantasmaRpc::with_transport("http://localhost:5172/rpc", transport.clone());
+
+            match call_path {
+                "call_value" => {
+                    assert_rpc_error_contains(
+                        client.call_value("getVersion", vec![]).await,
+                        expected_error,
+                    );
+                }
+                "call_with_raw" => {
+                    assert_rpc_error_contains(
+                        client.call_with_raw::<Value>("getVersion", vec![]).await,
+                        expected_error,
+                    );
+                }
+                "call_typed" => {
+                    assert_rpc_error_contains(
+                        client
+                            .call::<phantasma_sdk::BuildInfoResult>("getVersion", vec![])
+                            .await,
+                        expected_error,
+                    );
+                }
+                _ => unreachable!(),
+            }
+
+            let requests = transport.requests();
+            assert_eq!(requests.len(), 1, "{label} via {call_path}");
+            assert_eq!(requests[0]["id"], 1, "{label} via {call_path}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -93,7 +190,7 @@ async fn send_raw_transaction_accepts_hash_object_results() {
         200,
         json!({
             "jsonrpc": "2.0",
-            "id": "0",
+            "id": "1",
             "result": {"hash": "ABCD"}
         }),
     ));
@@ -158,7 +255,7 @@ async fn typed_raw_block_call_preserves_sdk_value_and_response_metadata() {
         200,
         json!({
             "jsonrpc": "2.0",
-            "id": "0",
+            "id": "1",
             "result": block
         }),
     ));
@@ -205,7 +302,7 @@ async fn typed_raw_block_height_call_preserves_scalar_result_shape() {
         200,
         json!({
             "jsonrpc": "2.0",
-            "id": "0",
+            "id": "1",
             "result": "123"
         }),
     ));
@@ -227,7 +324,7 @@ async fn typed_raw_transaction_by_block_call_preserves_sdk_parameter_order() {
         200,
         json!({
             "jsonrpc": "2.0",
-            "id": "0",
+            "id": "1",
             "result": {"hash": "TX1", "state": "Success"}
         }),
     ));
@@ -250,7 +347,7 @@ async fn typed_raw_transaction_by_block_call_preserves_sdk_parameter_order() {
 #[tokio::test]
 async fn rpc_alias_methods_preserve_python_parameter_order() {
     fn ok(result: Value) -> (u16, Value) {
-        (200, json!({"jsonrpc": "2.0", "id": "0", "result": result}))
+        (200, json!({"jsonrpc": "2.0", "id": "1", "result": result}))
     }
 
     let transport = MockTransport::with_responses([
@@ -352,7 +449,7 @@ async fn rpc_alias_methods_preserve_python_parameter_order() {
 #[tokio::test]
 async fn rpc_decodes_reference_shapes_and_coerces_scalars() {
     fn ok(result: Value) -> (u16, Value) {
-        (200, json!({"jsonrpc": "2.0", "id": "0", "result": result}))
+        (200, json!({"jsonrpc": "2.0", "id": "1", "result": result}))
     }
 
     let transport = MockTransport::with_responses([
@@ -674,26 +771,68 @@ fn rpc_dtos_decode_current_response_shapes_without_stale_aliases() {
 
 #[test]
 fn json_rpc_parser_fails_closed_on_malformed_responses() {
+    // Only the exact request id may unlock the result; missing/null/mismatched ids fail closed.
     assert_eq!(
-        parse_json_rpc_response(200, json!({"jsonrpc": "2.0", "id": 0, "result": true})).unwrap(),
+        parse_json_rpc_response(200, json!({"jsonrpc": "2.0", "id": 1, "result": true})).unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        parse_json_rpc_response(200, json!({"jsonrpc": "2.0", "id": "1", "result": true})).unwrap(),
         json!(true)
     );
     assert!(parse_json_rpc_response(200, json!([])).is_err());
     assert!(
-        parse_json_rpc_response(200, json!({"jsonrpc": "2.0", "id": "1", "result": true})).is_err()
+        parse_json_rpc_response(200, json!({"jsonrpc": "2.0", "id": 0, "result": true})).is_err()
     );
+    assert!(
+        parse_json_rpc_response(200, json!({"jsonrpc": "2.0", "id": "2", "result": true})).is_err()
+    );
+    assert!(parse_json_rpc_response(200, json!({"jsonrpc": "2.0", "result": true})).is_err());
     assert!(
         parse_json_rpc_response(200, json!({"jsonrpc": "2.0", "id": null, "result": true}))
             .is_err()
     );
     assert!(
-        parse_json_rpc_response(500, json!({"jsonrpc": "2.0", "id": "0", "result": true})).is_err()
+        parse_json_rpc_response(500, json!({"jsonrpc": "2.0", "id": "1", "result": true})).is_err()
     );
     assert!(parse_json_rpc_response(
         200,
-        json!({"jsonrpc": "2.0", "id": "0", "error": {"code": -32601, "message": "missing"}})
+        json!({"jsonrpc": "2.0", "id": "1", "error": {"code": -32601, "message": "missing"}})
     )
     .is_err());
+}
+
+#[test]
+fn json_rpc_parser_validates_id_before_error_status_and_result() {
+    let result = parse_json_rpc_response(
+        200,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "error": {"code": -32603, "message": "server error from another request"}
+        }),
+    );
+    assert_rpc_error_message(result.unwrap_err(), "response id mismatch");
+
+    let result = parse_json_rpc_response(
+        500,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "0",
+            "result": true
+        }),
+    );
+    assert_rpc_error_message(result.unwrap_err(), "response id mismatch");
+
+    let result = parse_json_rpc_response(
+        200,
+        json!({
+            "jsonrpc": "2.0",
+            "id": {"unexpected": 1},
+            "result": true
+        }),
+    );
+    assert_rpc_error_message(result.unwrap_err(), "response id mismatch");
 }
 
 #[test]

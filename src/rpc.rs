@@ -23,6 +23,8 @@ use crate::error::{rpc, PhantasmaError, Result};
 use crate::transaction::{tx_state_is_fault, tx_state_is_success, Transaction};
 use crate::vm::VMObject;
 
+const JSON_RPC_REQUEST_ID: u64 = 1;
+
 #[async_trait]
 pub trait RpcTransport: Send + Sync {
     /// Sends one JSON value and returns the HTTP status plus decoded JSON body.
@@ -149,7 +151,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
                 &self.endpoint,
                 json!({
                     "jsonrpc": "2.0",
-                    "id": "0",
+                    "id": JSON_RPC_REQUEST_ID,
                     "method": method,
                     "params": params,
                 }),
@@ -1120,12 +1122,16 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
 }
 
 pub fn parse_json_rpc_response(status: u16, body: Value) -> Result<Value> {
-    // Reference RPCs currently echo JSON-RPC id `"0"` as either a string or a
-    // number. Accept only those two shapes and fail closed on missing/mismatched
-    // ids so callers do not consume unrelated responses.
     let Some(object) = body.as_object() else {
         return rpc(None, "JSON-RPC response must be an object");
     };
+    let id = object.get("id").ok_or_else(|| PhantasmaError::Rpc {
+        code: None,
+        message: "missing id".into(),
+    })?;
+    if !json_rpc_id_matches(id, JSON_RPC_REQUEST_ID) {
+        return rpc(None, format!("response id mismatch: {id}"));
+    }
     if let Some(error) = object.get("error") {
         if let Some(error_object) = error.as_object() {
             let code = error_object.get("code").and_then(Value::as_i64);
@@ -1143,14 +1149,6 @@ pub fn parse_json_rpc_response(status: u16, body: Value) -> Result<Value> {
     if status >= 400 {
         return rpc(None, format!("HTTP {status}"));
     }
-    let id = object.get("id").ok_or_else(|| PhantasmaError::Rpc {
-        code: None,
-        message: "missing id".into(),
-    })?;
-    let id_ok = id == "0" || id == 0;
-    if !id_ok {
-        return rpc(None, format!("response id mismatch: {id}"));
-    }
     object
         .get("result")
         .cloned()
@@ -1158,6 +1156,16 @@ pub fn parse_json_rpc_response(status: u16, body: Value) -> Result<Value> {
             code: None,
             message: "missing result".into(),
         })
+}
+
+fn json_rpc_id_matches(id: &Value, expected: u64) -> bool {
+    if let Some(number) = id.as_u64() {
+        return number == expected;
+    }
+    if let Some(text) = id.as_str() {
+        return text == expected.to_string();
+    }
+    false
 }
 
 fn extract_hash(value: Value) -> Result<String> {
