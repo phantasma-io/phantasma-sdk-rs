@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use httpmock::{Method::POST, MockServer};
 use phantasma_sdk::{
     convert_decimals, parse_json_rpc_response, parse_json_rpc_response_for_request, PhantasmaError,
     PhantasmaRpc, RpcTransport,
@@ -111,6 +112,23 @@ async fn rpc_wrapper_builds_json_rpc_request() {
     assert_eq!(requests[0]["id"], 1);
     assert_eq!(requests[0]["method"], "getVersion");
     assert_eq!(requests[0]["params"], json!([]));
+}
+
+#[tokio::test]
+async fn reqwest_transport_rejects_response_body_above_configured_limit() {
+    let body = r#"{"jsonrpc":"2.0","id":"1","result":{"version":"3.0.0","commit":"abc123"}}"#;
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(POST).path("/rpc");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(body);
+    });
+    let client = PhantasmaRpc::new(server.url("/rpc")).with_max_response_bytes(body.len() - 1);
+
+    assert_rpc_error_contains(client.get_version().await, "response body exceeds");
+
+    mock.assert();
 }
 
 #[tokio::test]

@@ -28,6 +28,7 @@ use crate::transaction::{tx_state_is_fault, tx_state_is_success, Transaction};
 use crate::vm::VMObject;
 
 const INITIAL_JSON_RPC_REQUEST_ID: u64 = 1;
+pub const DEFAULT_MAX_RPC_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 #[async_trait]
 pub trait RpcTransport: Send + Sync {
@@ -38,9 +39,19 @@ pub trait RpcTransport: Send + Sync {
     async fn post_json(&self, url: &str, body: Value, timeout: Duration) -> Result<(u16, Value)>;
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ReqwestTransport {
     client: reqwest::Client,
+    max_response_bytes: usize,
+}
+
+impl Default for ReqwestTransport {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::default(),
+            max_response_bytes: DEFAULT_MAX_RPC_RESPONSE_BYTES,
+        }
+    }
 }
 
 #[async_trait]
@@ -53,8 +64,7 @@ impl RpcTransport for ReqwestTransport {
             .json(&body)
             .send()
             .await?;
-        let status = response.status().as_u16();
-        let text = response.text().await?;
+        let (status, text) = read_limited_response_text(response, self.max_response_bytes).await?;
         let value = serde_json::from_str::<Value>(&text).map_err(|err| {
             if status >= 400 {
                 PhantasmaError::Rpc {
@@ -70,6 +80,41 @@ impl RpcTransport for ReqwestTransport {
         })?;
         Ok((status, value))
     }
+}
+
+async fn read_limited_response_text(
+    mut response: reqwest::Response,
+    max_response_bytes: usize,
+) -> Result<(u16, String)> {
+    if max_response_bytes == 0 {
+        return rpc(None, "max response size must be positive");
+    }
+    let status = response.status().as_u16();
+    if let Some(content_length) = response.content_length() {
+        if content_length > max_response_bytes as u64 {
+            return rpc(
+                None,
+                format!("response body exceeds {max_response_bytes} bytes"),
+            );
+        }
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > max_response_bytes {
+            return rpc(
+                None,
+                format!("response body exceeds {max_response_bytes} bytes"),
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    let text = String::from_utf8(body).map_err(|err| PhantasmaError::Rpc {
+        code: None,
+        message: format!("response body is not valid UTF-8: {err}"),
+    })?;
+    Ok((status, text))
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +179,11 @@ impl PhantasmaRpc<ReqwestTransport> {
 
     pub fn testnet() -> Self {
         Self::new("https://testnet.phantasma.info/rpc")
+    }
+
+    pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.transport.max_response_bytes = max_response_bytes;
+        self
     }
 }
 
