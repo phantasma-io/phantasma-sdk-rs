@@ -5,6 +5,10 @@
 //! coercions, and transaction-hash handling.
 
 use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -23,7 +27,7 @@ use crate::error::{rpc, PhantasmaError, Result};
 use crate::transaction::{tx_state_is_fault, tx_state_is_success, Transaction};
 use crate::vm::VMObject;
 
-const JSON_RPC_REQUEST_ID: u64 = 1;
+const INITIAL_JSON_RPC_REQUEST_ID: u64 = 1;
 
 #[async_trait]
 pub trait RpcTransport: Send + Sync {
@@ -73,6 +77,7 @@ pub struct PhantasmaRpc<T = ReqwestTransport> {
     endpoint: String,
     timeout: Duration,
     transport: T,
+    next_request_id: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +124,7 @@ impl PhantasmaRpc<ReqwestTransport> {
             endpoint: endpoint.into(),
             timeout: Duration::from_secs(30),
             transport: ReqwestTransport::default(),
+            next_request_id: Arc::new(AtomicU64::new(INITIAL_JSON_RPC_REQUEST_ID)),
         }
     }
 
@@ -137,6 +143,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
             endpoint: endpoint.into(),
             timeout: Duration::from_secs(30),
             transport,
+            next_request_id: Arc::new(AtomicU64::new(INITIAL_JSON_RPC_REQUEST_ID)),
         }
     }
 
@@ -145,19 +152,26 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         self
     }
 
-    async fn post_json_rpc(&self, method: &str, params: Vec<Value>) -> Result<(u16, Value)> {
-        self.transport
+    fn next_json_rpc_request_id(&self) -> u64 {
+        self.next_request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn post_json_rpc(&self, method: &str, params: Vec<Value>) -> Result<(u16, Value, u64)> {
+        let request_id = self.next_json_rpc_request_id();
+        let (status, body) = self
+            .transport
             .post_json(
                 &self.endpoint,
                 json!({
                     "jsonrpc": "2.0",
-                    "id": JSON_RPC_REQUEST_ID,
+                    "id": request_id,
                     "method": method,
                     "params": params,
                 }),
                 self.timeout,
             )
-            .await
+            .await?;
+        Ok((status, body, request_id))
     }
 
     pub async fn call_value_with_raw(
@@ -165,9 +179,9 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         method: &str,
         params: Vec<Value>,
     ) -> Result<RpcCallResult<Value>> {
-        let (status, body) = self.post_json_rpc(method, params).await?;
+        let (status, body, request_id) = self.post_json_rpc(method, params).await?;
         let canonical_envelope_bytes = serde_json::to_vec(&body)?.len();
-        let raw_result = parse_json_rpc_response(status, body.clone())?;
+        let raw_result = parse_json_rpc_response_for_request(status, body.clone(), request_id)?;
         let canonical_result_bytes = serde_json::to_vec(&raw_result)?.len();
         Ok(RpcCallResult {
             value: raw_result.clone(),
@@ -182,8 +196,8 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
     }
 
     pub async fn call_value(&self, method: &str, params: Vec<Value>) -> Result<Value> {
-        let (status, body) = self.post_json_rpc(method, params).await?;
-        parse_json_rpc_response(status, body)
+        let (status, body, request_id) = self.post_json_rpc(method, params).await?;
+        parse_json_rpc_response_for_request(status, body, request_id)
     }
 
     pub async fn call_with_raw<R: DeserializeOwned>(
@@ -1122,6 +1136,14 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
 }
 
 pub fn parse_json_rpc_response(status: u16, body: Value) -> Result<Value> {
+    parse_json_rpc_response_for_request(status, body, INITIAL_JSON_RPC_REQUEST_ID)
+}
+
+pub fn parse_json_rpc_response_for_request(
+    status: u16,
+    body: Value,
+    expected_request_id: u64,
+) -> Result<Value> {
     let Some(object) = body.as_object() else {
         return rpc(None, "JSON-RPC response must be an object");
     };
@@ -1129,7 +1151,7 @@ pub fn parse_json_rpc_response(status: u16, body: Value) -> Result<Value> {
         code: None,
         message: "missing id".into(),
     })?;
-    if !json_rpc_id_matches(id, JSON_RPC_REQUEST_ID) {
+    if !json_rpc_id_matches(id, expected_request_id) {
         return rpc(None, format!("response id mismatch: {id}"));
     }
     if let Some(error) = object.get("error") {

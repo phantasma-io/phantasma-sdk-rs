@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use phantasma_sdk::{
-    convert_decimals, parse_json_rpc_response, PhantasmaError, PhantasmaRpc, RpcTransport,
+    convert_decimals, parse_json_rpc_response, parse_json_rpc_response_for_request, PhantasmaError,
+    PhantasmaRpc, RpcTransport,
 };
 use serde_json::{json, Value};
 
@@ -110,6 +111,56 @@ async fn rpc_wrapper_builds_json_rpc_request() {
     assert_eq!(requests[0]["id"], 1);
     assert_eq!(requests[0]["method"], "getVersion");
     assert_eq!(requests[0]["params"], json!([]));
+}
+
+#[tokio::test]
+async fn rpc_client_increments_request_ids_for_sequential_normal_calls() {
+    // Normal public calls must generate a fresh id and validate each response
+    // against the id produced for that specific request.
+    let transport = MockTransport::with_responses([
+        (
+            200,
+            json!({"jsonrpc": "2.0", "id": "1", "result": {"version": "3.0.0", "commit": "first"}}),
+        ),
+        (
+            200,
+            json!({"jsonrpc": "2.0", "id": "2", "result": {"version": "3.0.1", "commit": "second"}}),
+        ),
+    ]);
+    let client = PhantasmaRpc::with_transport("http://localhost:5172/rpc", transport.clone());
+
+    let first = client.get_version().await.unwrap();
+    let second = client.get_version().await.unwrap();
+
+    assert_eq!(first.commit, "first");
+    assert_eq!(second.commit, "second");
+    let requests = transport.requests();
+    assert_eq!(requests[0]["id"], 1);
+    assert_eq!(requests[1]["id"], 2);
+}
+
+#[tokio::test]
+async fn rpc_client_rejects_stale_response_id_after_counter_advances() {
+    // A stale response echo from the first request must not unlock a later
+    // result once the client has advanced to a different request id.
+    let transport = MockTransport::with_responses([
+        (
+            200,
+            json!({"jsonrpc": "2.0", "id": "1", "result": {"version": "3.0.0", "commit": "first"}}),
+        ),
+        (
+            200,
+            json!({"jsonrpc": "2.0", "id": "1", "result": {"version": "bad", "commit": "stale"}}),
+        ),
+    ]);
+    let client = PhantasmaRpc::with_transport("http://localhost:5172/rpc", transport.clone());
+
+    assert_eq!(client.get_version().await.unwrap().commit, "first");
+    assert_rpc_error_contains(client.get_version().await, "response id mismatch");
+
+    let requests = transport.requests();
+    assert_eq!(requests[0]["id"], 1);
+    assert_eq!(requests[1]["id"], 2);
 }
 
 #[tokio::test]
@@ -346,9 +397,18 @@ async fn typed_raw_transaction_by_block_call_preserves_sdk_parameter_order() {
 
 #[tokio::test]
 async fn rpc_alias_methods_preserve_python_parameter_order() {
-    fn ok(result: Value) -> (u16, Value) {
-        (200, json!({"jsonrpc": "2.0", "id": "1", "result": result}))
-    }
+    // This sequence exercises many wrapper calls against one client, so each
+    // mock response must echo the next generated request id instead of hiding
+    // stale-id bugs behind a fixed fixture.
+    let mut next_id = 1_u64;
+    let mut ok = |result: Value| {
+        let id = next_id;
+        next_id += 1;
+        (
+            200,
+            json!({"jsonrpc": "2.0", "id": id.to_string(), "result": result}),
+        )
+    };
 
     let transport = MockTransport::with_responses([
         ok(json!(0)),
@@ -444,13 +504,24 @@ async fn rpc_alias_methods_preserve_python_parameter_order() {
     assert_eq!(requests[8]["params"], json!(["ART", "1,2", false]));
     assert_eq!(requests[9]["method"], "getTokenSeriesById");
     assert_eq!(requests[9]["params"], json!(["ART", 0, "series", 0]));
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(request["id"], json!(index + 1));
+    }
 }
 
 #[tokio::test]
 async fn rpc_decodes_reference_shapes_and_coerces_scalars() {
-    fn ok(result: Value) -> (u16, Value) {
-        (200, json!({"jsonrpc": "2.0", "id": "1", "result": result}))
-    }
+    // The DTO fixture walk uses one client for several calls; echoed ids must
+    // follow the generated request ids so the parser contract is actually tested.
+    let mut next_id = 1_u64;
+    let mut ok = |result: Value| {
+        let id = next_id;
+        next_id += 1;
+        (
+            200,
+            json!({"jsonrpc": "2.0", "id": id.to_string(), "result": result}),
+        )
+    };
 
     let transport = MockTransport::with_responses([
         ok(json!({"version": "3.0.0", "commit": "abc123", "buildTimeUtc": "now"})),
@@ -484,6 +555,9 @@ async fn rpc_decodes_reference_shapes_and_coerces_scalars() {
     let requests = transport.requests();
     assert_eq!(requests[4]["method"], "sendCarbonTransaction");
     assert_eq!(requests[4]["params"], json!(["cafe"]));
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(request["id"], json!(index + 1));
+    }
 }
 
 #[test]
@@ -798,6 +872,21 @@ fn json_rpc_parser_fails_closed_on_malformed_responses() {
     assert!(parse_json_rpc_response(
         200,
         json!({"jsonrpc": "2.0", "id": "1", "error": {"code": -32601, "message": "missing"}})
+    )
+    .is_err());
+    assert_eq!(
+        parse_json_rpc_response_for_request(
+            200,
+            json!({"jsonrpc": "2.0", "id": "2", "result": true}),
+            2
+        )
+        .unwrap(),
+        json!(true)
+    );
+    assert!(parse_json_rpc_response_for_request(
+        200,
+        json!({"jsonrpc": "2.0", "id": "1", "result": true}),
+        2
     )
     .is_err());
 }
