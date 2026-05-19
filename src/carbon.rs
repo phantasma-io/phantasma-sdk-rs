@@ -419,12 +419,22 @@ impl<'a> CarbonReader<'a> {
     }
 
     pub fn read_length(&mut self) -> Result<usize> {
+        self.read_length_for(1)
+    }
+
+    pub fn read_length_for(&mut self, element_size: usize) -> Result<usize> {
+        if element_size == 0 {
+            return serialization("invalid array element size");
+        }
         let length = self.read4()?;
         if length < 0 {
             return serialization("negative array length");
         }
         let length = length as usize;
-        if length > self.remaining() {
+        let required = length.checked_mul(element_size).ok_or_else(|| {
+            PhantasmaError::Serialization("array length overflows byte count".into())
+        })?;
+        if required > self.remaining() {
             return serialization(format!(
                 "array length {length} exceeds remaining bytes {}",
                 self.remaining()
@@ -525,7 +535,7 @@ impl<'a> CarbonReader<'a> {
     }
 
     pub fn read_byte_arrays(&mut self) -> Result<Vec<Vec<u8>>> {
-        let count = self.read_length()?;
+        let count = self.read_length_for(4)?;
         (0..count).map(|_| self.read_byte_array()).collect()
     }
 
@@ -535,27 +545,27 @@ impl<'a> CarbonReader<'a> {
     }
 
     pub fn read_i16_array(&mut self) -> Result<Vec<i16>> {
-        let count = self.read_length()?;
+        let count = self.read_length_for(2)?;
         (0..count).map(|_| self.read2()).collect()
     }
 
     pub fn read_i32_array(&mut self) -> Result<Vec<i32>> {
-        let count = self.read_length()?;
+        let count = self.read_length_for(4)?;
         (0..count).map(|_| self.read4()).collect()
     }
 
     pub fn read_i64_array(&mut self) -> Result<Vec<i64>> {
-        let count = self.read_length()?;
+        let count = self.read_length_for(8)?;
         (0..count).map(|_| self.read8()).collect()
     }
 
     pub fn read_u64_array(&mut self) -> Result<Vec<u64>> {
-        let count = self.read_length()?;
+        let count = self.read_length_for(8)?;
         (0..count).map(|_| self.read8u()).collect()
     }
 
     pub fn read_int_array(&mut self, width: u8, signed: bool) -> Result<Vec<i128>> {
-        let count = self.read_length()?;
+        let count = self.read_length_for(width as usize)?;
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
             let value = match width {
@@ -1327,7 +1337,7 @@ impl VMDynamicVariable {
             VMType::ArrayInt64 => VMValue::ArrayInt64(reader.read_i64_array()?),
             VMType::ArrayInt256 => VMValue::ArrayInt256(reader.read_big_int_array()?),
             VMType::ArrayBytes16 => {
-                let count = reader.read_length()?;
+                let count = reader.read_length_for(16)?;
                 let mut out = Vec::with_capacity(count);
                 for _ in 0..count {
                     out.push(reader.read16()?);
@@ -1335,7 +1345,7 @@ impl VMDynamicVariable {
                 VMValue::ArrayBytes16(out)
             }
             VMType::ArrayBytes32 => {
-                let count = reader.read_length()?;
+                let count = reader.read_length_for(32)?;
                 let mut out = Vec::with_capacity(count);
                 for _ in 0..count {
                     out.push(reader.read32()?);
@@ -1343,7 +1353,7 @@ impl VMDynamicVariable {
                 VMValue::ArrayBytes32(out)
             }
             VMType::ArrayBytes64 => {
-                let count = reader.read_length()?;
+                let count = reader.read_length_for(64)?;
                 let mut out = Vec::with_capacity(count);
                 for _ in 0..count {
                     out.push(reader.read64()?);
@@ -4080,7 +4090,7 @@ pub fn parse_mint_non_fungible_result(
 ) -> Result<Vec<Bytes32>> {
     let data = decode_hex(result_hex)?;
     let mut reader = CarbonReader::new(&data);
-    let count = reader.read_length()?;
+    let count = reader.read_length_for(8)?;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         out.push(get_nft_address(carbon_token_id, reader.read8u()?));
@@ -4094,7 +4104,11 @@ pub fn parse_mint_phantasma_non_fungible_result(
 ) -> Result<Vec<PhantasmaNFTMintResult>> {
     let data = decode_hex(result_hex)?;
     let mut reader = CarbonReader::new(&data);
-    let out = read_carbon_array(&mut reader)?;
+    let count = reader.read_length_for(40)?;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        out.push(PhantasmaNFTMintResult::read_carbon(&mut reader)?);
+    }
     reader.assert_eof()?;
     Ok(out)
 }

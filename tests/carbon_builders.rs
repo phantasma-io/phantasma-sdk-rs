@@ -123,6 +123,14 @@ fn token_result_parsers_match_reference_behaviour() {
 }
 
 #[test]
+fn carbon_reader_rejects_fixed_width_array_length_before_allocation() {
+    let mut reader = CarbonReader::new(&[2, 0, 0, 0, 1, 2, 3, 4]);
+    let err = reader.read_i32_array().unwrap_err();
+
+    assert!(err.to_string().contains("exceeds remaining bytes"));
+}
+
+#[test]
 fn token_metadata_and_symbol_validation_match_reference_sdks() {
     // Token builders reject malformed public inputs before invalid Carbon payloads are produced.
     check_token_symbol("SOUL").unwrap();
