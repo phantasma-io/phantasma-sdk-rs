@@ -539,27 +539,65 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
 
     pub async fn get_organization(
         &self,
-        organization_id: &str,
-        extended: bool,
+        name: &str,
+        include_member_count: bool,
     ) -> Result<OrganizationResult> {
         self.call(
             "getOrganization",
-            vec![json!(organization_id), json!(extended)],
+            vec![json!(name), json!(include_member_count)],
         )
         .await
     }
 
-    pub async fn get_organization_by_name(
+    pub async fn get_organizations(
         &self,
-        name: &str,
-        extended: bool,
-    ) -> Result<OrganizationResult> {
-        self.call("getOrganizationByName", vec![json!(name), json!(extended)])
-            .await
+        page_size: u32,
+        cursor: &str,
+        include_member_count: bool,
+    ) -> Result<CursorPaginatedResult<Vec<OrganizationResult>>> {
+        self.call(
+            "getOrganizations",
+            vec![json!(page_size), json!(cursor), json!(include_member_count)],
+        )
+        .await
     }
 
-    pub async fn get_organizations(&self, extended: bool) -> Result<Vec<OrganizationResult>> {
-        self.call("getOrganizations", vec![json!(extended)]).await
+    pub async fn get_organization_members(
+        &self,
+        name: &str,
+        page_size: u32,
+        cursor: &str,
+        include_member_time: bool,
+    ) -> Result<CursorPaginatedResult<Vec<OrganizationMemberResult>>> {
+        self.call(
+            "getOrganizationMembers",
+            vec![
+                json!(name),
+                json!(page_size),
+                json!(cursor),
+                json!(include_member_time),
+            ],
+        )
+        .await
+    }
+
+    pub async fn get_organization_member(
+        &self,
+        name: &str,
+        address: &str,
+        check_address_reserved_byte: bool,
+        address_type: &str,
+    ) -> Result<OrganizationMemberResult> {
+        self.call(
+            "getOrganizationMember",
+            vec![
+                json!(name),
+                json!(address),
+                json!(check_address_reserved_byte),
+                json!(address_type),
+            ],
+        )
+        .await
     }
 
     pub async fn get_leaderboard(&self, name: &str) -> Result<LeaderboardResult> {
@@ -1621,9 +1659,20 @@ pub struct GovernanceResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct OrganizationResult {
-    pub id: Option<String>,
     pub name: Option<String>,
-    pub members: Option<Vec<String>>,
+    pub owner: Option<String>,
+    pub carbon_owner: Option<String>,
+    pub metadata: Vec<TokenPropertyResult>,
+    pub member_count: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct OrganizationMemberResult {
+    pub address: Option<String>,
+    pub carbon_address: Option<String>,
+    pub is_member: bool,
+    pub member_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

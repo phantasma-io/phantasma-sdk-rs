@@ -439,6 +439,10 @@ async fn rpc_alias_methods_preserve_python_parameter_order() {
         ok(json!({"result": [], "cursor": ""})),
         ok(json!([])),
         ok(json!({})),
+        ok(json!({"result": [], "cursor": ""})),
+        ok(json!({"address": "Pmember", "isMember": true})),
+        ok(json!({"result": [], "cursor": ""})),
+        ok(json!({"address": "Pmember", "isMember": true})),
     ]);
     let client = PhantasmaRpc::with_transport("http://localhost:5172/rpc", transport.clone());
 
@@ -477,6 +481,15 @@ async fn rpc_alias_methods_preserve_python_parameter_order() {
     client.get_nfts_text("ART", "1,2", false).await.unwrap();
     client
         .get_token_series_by_id("ART", "series")
+        .await
+        .unwrap();
+    client.get_organizations(2, "cursor", true).await.unwrap();
+    client
+        .get_organization_members("masters", 2, "", true)
+        .await
+        .unwrap();
+    client
+        .get_organization_member("masters", "Pmember", true, "Carbon")
         .await
         .unwrap();
 
@@ -522,6 +535,15 @@ async fn rpc_alias_methods_preserve_python_parameter_order() {
     assert_eq!(requests[8]["params"], json!(["ART", "1,2", false]));
     assert_eq!(requests[9]["method"], "getTokenSeriesById");
     assert_eq!(requests[9]["params"], json!(["ART", 0, "series", 0]));
+    assert_eq!(requests[10]["method"], "getOrganizations");
+    assert_eq!(requests[10]["params"], json!([2, "cursor", true]));
+    assert_eq!(requests[11]["method"], "getOrganizationMembers");
+    assert_eq!(requests[11]["params"], json!(["masters", 2, "", true]));
+    assert_eq!(requests[12]["method"], "getOrganizationMember");
+    assert_eq!(
+        requests[12]["params"],
+        json!(["masters", "Pmember", true, "Carbon"])
+    );
     for (index, request) in requests.iter().enumerate() {
         assert_eq!(request["id"], json!(index + 1));
     }
@@ -714,8 +736,29 @@ fn rpc_dtos_decode_current_response_shapes_without_stale_aliases() {
     assert_eq!(nexus.tokens, None);
     let organization: phantasma_sdk::OrganizationResult =
         serde_json::from_value(json!({})).unwrap();
-    assert_eq!(organization.id, None);
-    assert_eq!(organization.members, None);
+    assert_eq!(organization.member_count, None);
+    assert!(organization.metadata.is_empty());
+    let organization: phantasma_sdk::OrganizationResult = serde_json::from_value(json!({
+        "name": "masters",
+        "owner": "Powner",
+        "carbonOwner": "0xowner",
+        "memberCount": "2",
+        "metadata": [{"key": "role", "value": "validators"}]
+    }))
+    .unwrap();
+    assert_eq!(organization.carbon_owner.as_deref(), Some("0xowner"));
+    assert_eq!(organization.member_count.as_deref(), Some("2"));
+    assert_eq!(organization.metadata[0].key, "role");
+    let organization_member: phantasma_sdk::OrganizationMemberResult =
+        serde_json::from_value(json!({
+            "address": "Pmember",
+            "carbonAddress": "0xmember",
+            "isMember": true,
+            "memberTime": 123
+        }))
+        .unwrap();
+    assert!(organization_member.is_member);
+    assert_eq!(organization_member.member_time, Some(123));
     let leaderboard: phantasma_sdk::LeaderboardResult = serde_json::from_value(json!({})).unwrap();
     assert_eq!(leaderboard.name, None);
     assert_eq!(leaderboard.rows, None);
