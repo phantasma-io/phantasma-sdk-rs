@@ -30,6 +30,9 @@ use crate::vm::VMObject;
 const INITIAL_JSON_RPC_REQUEST_ID: u64 = 1;
 pub const DEFAULT_MAX_RPC_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// HTTP header carrying the API key on each request.
+pub const API_KEY_HEADER: &str = "X-Api-Key";
+
 #[async_trait]
 pub trait RpcTransport: Send + Sync {
     /// Sends one JSON value and returns the HTTP status plus decoded JSON body.
@@ -43,6 +46,7 @@ pub trait RpcTransport: Send + Sync {
 pub struct ReqwestTransport {
     client: reqwest::Client,
     max_response_bytes: usize,
+    api_key: Option<String>,
 }
 
 impl Default for ReqwestTransport {
@@ -50,20 +54,27 @@ impl Default for ReqwestTransport {
         Self {
             client: reqwest::Client::default(),
             max_response_bytes: DEFAULT_MAX_RPC_RESPONSE_BYTES,
+            api_key: None,
         }
+    }
+}
+
+impl ReqwestTransport {
+    /// Sets the API key sent in the [`API_KEY_HEADER`] header on every request.
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
     }
 }
 
 #[async_trait]
 impl RpcTransport for ReqwestTransport {
     async fn post_json(&self, url: &str, body: Value, timeout: Duration) -> Result<(u16, Value)> {
-        let response = self
-            .client
-            .post(url)
-            .timeout(timeout)
-            .json(&body)
-            .send()
-            .await?;
+        let mut request = self.client.post(url).timeout(timeout).json(&body);
+        if let Some(api_key) = &self.api_key {
+            request = request.header(API_KEY_HEADER, api_key);
+        }
+        let response = request.send().await?;
         let (status, text) = read_limited_response_text(response, self.max_response_bytes).await?;
         let value = serde_json::from_str::<Value>(&text).map_err(|err| {
             if status >= 400 {
@@ -183,6 +194,12 @@ impl PhantasmaRpc<ReqwestTransport> {
 
     pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
         self.transport.max_response_bytes = max_response_bytes;
+        self
+    }
+
+    /// Sets the API key sent in the [`API_KEY_HEADER`] header on every request.
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.transport.api_key = Some(api_key.into());
         self
     }
 }
@@ -1235,10 +1252,23 @@ pub fn parse_json_rpc_response_for_request(
     let Some(object) = body.as_object() else {
         return rpc(None, "JSON-RPC response must be an object");
     };
-    let id = object.get("id").ok_or_else(|| PhantasmaError::Rpc {
-        code: None,
-        message: "missing id".into(),
-    })?;
+
+    let Some(id) = object.get("id") else {
+        // A response with no JSON-RPC id is not a JSON-RPC envelope: it is an HTTP-level rejection
+        // (401 keys-only, 429 rate limit, ...). Surface its status and any message text instead of a
+        // misleading "missing id". A correlated response (id present) is still id-validated below first.
+        if status >= 400 {
+            let detail = object
+                .get("error")
+                .and_then(Value::as_str)
+                .or_else(|| object.get("message").and_then(Value::as_str));
+            return match detail {
+                Some(message) => rpc(None, format!("HTTP {status}: {message}")),
+                None => rpc(None, format!("HTTP {status}")),
+            };
+        }
+        return rpc(None, "missing id");
+    };
     if !json_rpc_id_matches(id, expected_request_id) {
         return rpc(None, format!("response id mismatch: {id}"));
     }

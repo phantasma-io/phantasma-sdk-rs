@@ -1005,3 +1005,40 @@ fn rpc_helpers_cover_common_result_shapes() {
         1.into()
     );
 }
+
+#[tokio::test]
+async fn reqwest_transport_sends_api_key_header() {
+    let body = r#"{"jsonrpc":"2.0","id":"1","result":{"version":"3.0.0","commit":"abc123"}}"#;
+    let server = MockServer::start();
+    // The mock only matches when the X-Api-Key header is present with the configured value.
+    let mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/rpc")
+            .header("X-Api-Key", "test-key");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(body);
+    });
+    let client = PhantasmaRpc::new(server.url("/rpc")).with_api_key("test-key");
+
+    let result = client.get_version().await.unwrap();
+
+    assert_eq!(result.version, "3.0.0");
+    mock.assert();
+}
+
+#[test]
+fn parse_json_rpc_response_surfaces_http_rejections() {
+    // 401 keys-only gate returns {"error":"..."} with no JSON-RPC id; surface status + message,
+    // not a misleading "missing id".
+    let err = parse_json_rpc_response_for_request(401, json!({ "error": "API key required" }), 7)
+        .unwrap_err();
+    assert_rpc_error_message(err, "HTTP 401");
+    let err = parse_json_rpc_response_for_request(401, json!({ "error": "API key required" }), 7)
+        .unwrap_err();
+    assert_rpc_error_message(err, "API key required");
+
+    // 429 rate limit with an opaque JSON body.
+    let err = parse_json_rpc_response_for_request(429, json!({}), 7).unwrap_err();
+    assert_rpc_error_message(err, "HTTP 429");
+}
