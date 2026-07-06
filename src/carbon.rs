@@ -1626,6 +1626,12 @@ impl CarbonSerializable for ChainConfig {
     }
 }
 
+/// On-chain gas configuration (governance module).
+///
+/// The gas-model-v2 extension fields serialize only for `version >= 1`, mirroring the node's
+/// data_blockchain.h wire format exactly: the version-0 byte image is frozen forever for
+/// historical replay, and a version>=1 image truncated to the v0 length fails to parse (the
+/// tail read errors on end of stream).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GasConfig {
     pub version: u8,
@@ -1647,6 +1653,35 @@ pub struct GasConfig {
     pub gas_fee_register_name: u64,
     pub gas_burn_ratio_mul: u64,
     pub gas_burn_ratio_shift: u8,
+    // Gas-model-v2 extension (version >= 1 only).
+    /// Floor applied to every settled gas bill (kcal-base). 0 = no floor (v1-equivalent).
+    pub minimum_gas_bill: u64,
+    /// Producer fee-split ratio; same mul/shift fixed-point form as the burn ratio.
+    pub gas_producer_ratio_mul: u64,
+    pub gas_producer_ratio_shift: u8,
+    /// Dapp (tx gasTarget) fee-split ratio.
+    pub gas_dapp_ratio_mul: u64,
+    pub gas_dapp_ratio_shift: u8,
+    /// Product-decision prices ("policy fees") in kcal-base, charged directly with no fee
+    /// multiplier stage. Under v2 they replace the unit-priced gas_fee_create_token_* and
+    /// gas_fee_register_name fields, which stay serialized for version-0 replay.
+    pub policy_fee_create_token_base: u64,
+    /// Halved per symbol char after the first (v1 rule kept).
+    pub policy_fee_create_token_symbol: u64,
+    pub policy_fee_create_token_series: u64,
+    /// Shifted right by (name length - 1) like the v1 field (v1 rule kept).
+    pub policy_fee_register_name: u64,
+    /// The frozen pre-flip data_escrow_per_row: storage rows existing before the v2 flip
+    /// refund at this price (exactly what they escrowed under v1). Immutable after the flip.
+    pub legacy_data_escrow_per_row: u64,
+}
+
+impl GasConfig {
+    /// True when this config activates the gas-model-v2 billing rules (config version >= 1).
+    /// The gas model is gated by the config version, not by a chain feature level.
+    pub fn has_gas_model_v2(&self) -> bool {
+        self.version >= 1
+    }
 }
 
 impl CarbonSerializable for GasConfig {
@@ -1670,11 +1705,25 @@ impl CarbonSerializable for GasConfig {
         writer.write8u(self.gas_fee_register_name);
         writer.write8u(self.gas_burn_ratio_mul);
         writer.write1(self.gas_burn_ratio_shift);
+        if self.version == 0 {
+            // Version-0 wire image must stay byte-identical to the pre-v2 layout.
+            return Ok(());
+        }
+        writer.write8u(self.minimum_gas_bill);
+        writer.write8u(self.gas_producer_ratio_mul);
+        writer.write1(self.gas_producer_ratio_shift);
+        writer.write8u(self.gas_dapp_ratio_mul);
+        writer.write1(self.gas_dapp_ratio_shift);
+        writer.write8u(self.policy_fee_create_token_base);
+        writer.write8u(self.policy_fee_create_token_symbol);
+        writer.write8u(self.policy_fee_create_token_series);
+        writer.write8u(self.policy_fee_register_name);
+        writer.write8u(self.legacy_data_escrow_per_row);
         Ok(())
     }
 
     fn read_carbon(reader: &mut CarbonReader<'_>) -> Result<Self> {
-        Ok(Self {
+        let mut config = Self {
             version: reader.read1()?,
             max_name_length: reader.read1()?,
             max_token_symbol_length: reader.read1()?,
@@ -1694,7 +1743,24 @@ impl CarbonSerializable for GasConfig {
             gas_fee_register_name: reader.read8u()?,
             gas_burn_ratio_mul: reader.read8u()?,
             gas_burn_ratio_shift: reader.read1()?,
-        })
+            ..Self::default()
+        };
+        if config.version == 0 {
+            // Version-0 rows carry no v2 tail; the defaults above already zero it.
+            return Ok(config);
+        }
+        // version >= 1: the tail is mandatory; a truncated image errors (end of stream).
+        config.minimum_gas_bill = reader.read8u()?;
+        config.gas_producer_ratio_mul = reader.read8u()?;
+        config.gas_producer_ratio_shift = reader.read1()?;
+        config.gas_dapp_ratio_mul = reader.read8u()?;
+        config.gas_dapp_ratio_shift = reader.read1()?;
+        config.policy_fee_create_token_base = reader.read8u()?;
+        config.policy_fee_create_token_symbol = reader.read8u()?;
+        config.policy_fee_create_token_series = reader.read8u()?;
+        config.policy_fee_register_name = reader.read8u()?;
+        config.legacy_data_escrow_per_row = reader.read8u()?;
+        Ok(config)
     }
 }
 
@@ -3225,6 +3291,368 @@ impl CarbonSerializable for SignedTxMsg {
         };
         Ok(Self { msg, witnesses })
     }
+}
+
+// --- Tier-1 fee estimator -------------------------------------------------------------------
+// Closed-form gas/data offers for native operations, exact under both gas models (selected by
+// GasConfig::version). Mirrors the validator billing formula (node blockchain.cpp settlement +
+// token/governance contract gas sites); any change to those formulas ships as a new gas-model
+// version, never silently. The unused part of a gas offer is always refunded, so generous
+// estimates only lock the balance for the block, they cost nothing.
+
+/// Gas model v2 price of block-carried bytes, in gas units per byte. A versioned consensus
+/// constant of the v2 gas model (node data_blockchain.h kGasModelV2UnitsPerBlockDataByte),
+/// deliberately not part of the on-chain config.
+pub const GAS_MODEL_V2_UNITS_PER_BLOCK_DATA_BYTE: u64 = 25;
+
+/// Serialized size of one witness-array entry (32-byte address + 64-byte signature).
+pub const WITNESS_ARRAY_ENTRY_BYTES: u32 = 96;
+
+/// Serialized size of one bare signature (native TxTypes carry no witness array).
+pub const NATIVE_SIGNATURE_BYTES: u32 = 64;
+
+/// Native operation kinds supported by the Tier-1 fee estimator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeFeeKind {
+    /// Fungible token transfer (TxTypes TransferFungible / _GasPayer).
+    TransferFungible,
+    /// NFT transfer of `count` instances.
+    TransferNonFungible,
+    /// Fungible mint.
+    MintFungible,
+    /// NFT mint of `count` instances.
+    MintNonFungible,
+    /// Fungible burn.
+    BurnFungible,
+    /// NFT burn of `count` instances.
+    BurnNonFungible,
+    /// TokenContract.CreateToken call; set `symbol_length` when a symbol is used.
+    CreateToken,
+    /// TokenContract.CreateTokenSeries call.
+    CreateTokenSeries,
+    /// GovernanceContract.RegisterName call; `name_length` is required.
+    RegisterName,
+    /// Generic Phantasma VM script transaction (AllowGas/SpendGas pattern: stake, marketplace,
+    /// custom contract calls). Script opcode costs are not closed-form in Tier-1; the estimate
+    /// budgets `script_units_allowance` VM work units on top of the byte fee. For an exact
+    /// script bill use the node-side Tier-2 estimator once available.
+    Script,
+}
+
+impl NativeFeeKind {
+    fn uses_bare_signatures(self) -> bool {
+        matches!(
+            self,
+            Self::TransferFungible
+                | Self::TransferNonFungible
+                | Self::MintFungible
+                | Self::MintNonFungible
+                | Self::BurnFungible
+                | Self::BurnNonFungible
+        )
+    }
+}
+
+/// Optional inputs for [`estimate_native_fee`]. `Default` produces a safe single-signer
+/// estimate; set fields for exactness.
+#[derive(Debug, Clone)]
+pub struct NativeFeeParams {
+    /// Instance count for NFT kinds (transferred/minted/burned instances).
+    pub count: u32,
+    /// Token symbol length in characters (CreateToken). 0 = no symbol.
+    pub symbol_length: u32,
+    /// Registered name length in characters (RegisterName kind, required).
+    pub name_length: u32,
+    /// Full signed transaction size in bytes (the envelope carried in the block). 0 = use a
+    /// conservative per-kind default. Under gas model v2 every envelope byte is billed, so
+    /// pass the real size (see [`envelope_bytes_for`]) for exact numbers.
+    pub envelope_bytes: u32,
+    /// User payload bytes attached to the tx (billed under gas model v1).
+    pub payload_bytes: u32,
+    /// Maximum number of paid storage rows the transaction can create (fresh token-balance
+    /// rows, NFT lookup rows, ...). `None` = the per-kind worst-case default; `Some(0)` = the
+    /// tx cannot create paid rows. SOUL/KCAL balance rows are free and never count. Determines
+    /// max_data: escrow = rows * data_escrow_per_row.
+    pub fresh_rows: Option<u64>,
+    /// Per-instance ROM+RAM bytes for MintNonFungible (stored state, drives escrow).
+    pub rom_ram_bytes: u32,
+    /// VM work-unit allowance for the Script kind. The default (5000) exceeds every script
+    /// seen in mainnet history (max 3392 units) with margin.
+    pub script_units_allowance: u64,
+}
+
+impl Default for NativeFeeParams {
+    fn default() -> Self {
+        Self {
+            count: 1,
+            symbol_length: 0,
+            name_length: 0,
+            envelope_bytes: 0,
+            payload_bytes: 0,
+            fresh_rows: None,
+            rom_ram_bytes: 0,
+            script_units_allowance: 5000,
+        }
+    }
+}
+
+/// Result of a Tier-1 fee estimate. Gas values are kcal-base (1 KCAL = 1e10 kcal-base);
+/// `max_data` is in data-token atoms (SOUL, 1 SOUL = 1e8 atoms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeFeeEstimate {
+    /// Recommended gas offer (TxMsg max_gas). Includes deterministic headroom; the unused part
+    /// is refunded.
+    pub max_gas: u64,
+    /// Recommended storage-escrow ceiling (TxMsg max_data). Only the actually created rows are
+    /// escrowed.
+    pub max_data: u64,
+    /// The bill the chain formula yields for exactly the provided inputs (no headroom).
+    pub expected_gas_bill: u64,
+}
+
+/// Envelope size (signed tx bytes as carried in the block) from a serialized unsigned message
+/// length and the number of signers. Use with [`NativeFeeParams::envelope_bytes`] for exact v2
+/// estimates. Witness layout mirrors SignedTxMsg: native TxTypes append bare 64-byte
+/// signatures (one, or two for the _GasPayer variants); Call/Trade/Phantasma txs append a
+/// length-prefixed witness array (32-byte address + 64-byte signature per entry).
+pub fn envelope_bytes_for(
+    kind: NativeFeeKind,
+    serialized_message_length: u32,
+    witness_count: u32,
+) -> u32 {
+    if kind.uses_bare_signatures() {
+        serialized_message_length + NATIVE_SIGNATURE_BYTES * witness_count
+    } else {
+        // CreateToken/CreateTokenSeries/RegisterName ride TxTypes::Call; Script rides
+        // TxTypes::Phantasma - both carry the witness array form.
+        serialized_message_length + 4 + WITNESS_ARRAY_ENTRY_BYTES * witness_count
+    }
+}
+
+/// Estimates max_gas/max_data for a native operation under the given on-chain gas config (see
+/// the getGasConfig RPC method / `PhantasmaRpc::get_gas_config`).
+pub fn estimate_native_fee(
+    kind: NativeFeeKind,
+    config: &GasConfig,
+    params: &NativeFeeParams,
+) -> Result<NativeFeeEstimate> {
+    if params.count == 0 {
+        return builder("estimate_native_fee count must be positive");
+    }
+    let count = params.count as u64;
+    let v2 = config.has_gas_model_v2();
+
+    // Work units consumed by the operation itself (the ConsumeGas amounts in the token /
+    // governance contracts) and, under v2, the direct kcal-base policy fee that replaces the
+    // v1 unit-priced product prices.
+    let mut work_units: u64 = 0;
+    let mut policy_fee: u64 = 0;
+    match kind {
+        NativeFeeKind::TransferFungible
+        | NativeFeeKind::MintFungible
+        | NativeFeeKind::BurnFungible => {
+            work_units = config.gas_fee_transfer;
+        }
+        NativeFeeKind::TransferNonFungible
+        | NativeFeeKind::MintNonFungible
+        | NativeFeeKind::BurnNonFungible => {
+            work_units = config.gas_fee_transfer.saturating_mul(count);
+        }
+        NativeFeeKind::CreateToken => {
+            // Symbol price halves per character after the first; shift is validated by the
+            // chain against max_token_symbol_length, mirror that bound here.
+            let shift = symbol_shift(
+                params.symbol_length,
+                config.max_token_symbol_length,
+                "symbol_length",
+            )?;
+            if v2 {
+                policy_fee = config.policy_fee_create_token_base;
+                if params.symbol_length > 0 {
+                    policy_fee =
+                        policy_fee.saturating_add(config.policy_fee_create_token_symbol >> shift);
+                }
+            } else {
+                work_units = config.gas_fee_create_token_base;
+                if params.symbol_length > 0 {
+                    work_units =
+                        work_units.saturating_add(config.gas_fee_create_token_symbol >> shift);
+                }
+            }
+        }
+        NativeFeeKind::CreateTokenSeries => {
+            if v2 {
+                policy_fee = config.policy_fee_create_token_series;
+            } else {
+                work_units = config.gas_fee_create_token_series;
+            }
+        }
+        NativeFeeKind::RegisterName => {
+            if params.name_length == 0 {
+                return builder("estimate_native_fee name_length is required for RegisterName");
+            }
+            let shift = symbol_shift(params.name_length, config.max_name_length, "name_length")?;
+            if v2 {
+                policy_fee = config.policy_fee_register_name >> shift;
+            } else {
+                work_units = config.gas_fee_register_name >> shift;
+            }
+        }
+        NativeFeeKind::Script => {
+            work_units = params.script_units_allowance;
+        }
+    }
+
+    let rows = params
+        .fresh_rows
+        .unwrap_or_else(|| default_fresh_rows(kind, count, params.rom_ram_bytes));
+    let envelope = if params.envelope_bytes > 0 {
+        params.envelope_bytes as u64
+    } else {
+        default_envelope_bytes(kind, count, params.rom_ram_bytes)
+    };
+    // Native TxTypes store no events in the block; script txs do (Notify), so budget some.
+    let event_bytes: u64 = if kind == NativeFeeKind::Script {
+        512
+    } else {
+        0
+    };
+
+    let (expected, max_gas) = if v2 {
+        // v2 formula: bill = mul_shift(work_units + block_data*25) + policy_fee, floored at
+        // minimum_gas_bill. block_data = envelope + events + net storage quanta (quanta are
+        // added to the byte count by the chain formula).
+        let expected = bill_v2(work_units, envelope, event_bytes, rows, policy_fee, config);
+        // Offer headroom: +25% over the padded bill covers witness-size wiggle and event
+        // variance; deterministic and always refunded down to the actual bill.
+        let padded = bill_v2(
+            work_units,
+            round_up(envelope, 128),
+            event_bytes,
+            rows,
+            policy_fee,
+            config,
+        );
+        let mut max_gas = padded.saturating_add(padded / 4);
+        max_gas = max_gas
+            .max(config.minimum_gas_bill)
+            .max(config.minimum_gas_offer);
+        (expected, max_gas)
+    } else {
+        // v1 formula: bill = (work_units * mult >> shift) + block_data * gas_fee_per_byte
+        // where block_data = payload + events + net storage quanta (no envelope term, no
+        // floor).
+        let work = mul_shift(work_units, config.fee_multiplier, config.fee_shift);
+        let block_data = (params.payload_bytes as u64)
+            .saturating_add(event_bytes)
+            .saturating_add(rows);
+        let expected = work.saturating_add(block_data.saturating_mul(config.gas_fee_per_byte));
+        // Offer shape mirrors the validator's own test-agent stdFee: a 2x minimum-offer pad
+        // plus a flat 1 KiB block-data allowance on top of the work term.
+        let byte_allowance = block_data.max(1024);
+        let max_gas = (config.minimum_gas_offer * 2)
+            .saturating_add(work)
+            .saturating_add(byte_allowance.saturating_mul(config.gas_fee_per_byte));
+        (expected, max_gas)
+    };
+
+    Ok(NativeFeeEstimate {
+        max_gas,
+        max_data: rows.saturating_mul(config.data_escrow_per_row),
+        expected_gas_bill: expected,
+    })
+}
+
+fn bill_v2(
+    work_units: u64,
+    envelope: u64,
+    event_bytes: u64,
+    rows: u64,
+    policy_fee: u64,
+    config: &GasConfig,
+) -> u64 {
+    let block_data = envelope.saturating_add(event_bytes).saturating_add(rows);
+    let byte_units = block_data.saturating_mul(GAS_MODEL_V2_UNITS_PER_BLOCK_DATA_BYTE);
+    let bill = mul_shift(
+        work_units.saturating_add(byte_units),
+        config.fee_multiplier,
+        config.fee_shift,
+    )
+    .saturating_add(policy_fee);
+    bill.max(config.minimum_gas_bill)
+}
+
+// Chain fee scaling: (value * fee_multiplier) >> fee_shift with a 128-bit intermediate,
+// saturating to u64. Matches the validator's v2 MulShiftSaturateU64; for sane v1 configs (live
+// values never overflow 64 bits) it is also bit-identical to the v1 math.
+fn mul_shift(value: u64, multiplier: u64, shift: u8) -> u64 {
+    if shift >= 64 {
+        return 0; // the chain clamps oversized shifts to a zero delta
+    }
+    let wide = ((value as u128) * (multiplier as u128)) >> shift;
+    u64::try_from(wide).unwrap_or(u64::MAX)
+}
+
+fn symbol_shift(length: u32, max_length: u8, param_name: &str) -> Result<u32> {
+    if length == 0 {
+        return Ok(0);
+    }
+    let shift = length - 1;
+    // The chain asserts shift < max_name_length / max_token_symbol_length; a longer input
+    // could never be admitted, so reject it here instead of quoting a fee for an impossible tx.
+    if max_length != 0 && shift >= max_length as u32 {
+        return builder(format!(
+            "estimate_native_fee {param_name} {length} exceeds the chain maximum {max_length}"
+        ));
+    }
+    Ok(shift)
+}
+
+// Worst-case paid rows the operation can create (drives max_data). Refund-only operations
+// (burns) need no escrow allowance: refunds never require max_data budget.
+fn default_fresh_rows(kind: NativeFeeKind, count: u64, rom_ram_bytes: u32) -> u64 {
+    match kind {
+        // Recipient balance row may be fresh (SOUL/KCAL rows would be free).
+        NativeFeeKind::TransferFungible | NativeFeeKind::MintFungible => 1,
+        // Per instance the chain deletes the sender's NFT-lookup row and creates the
+        // recipient's (creation escrows at the current price, the deletion refunds the old
+        // row's own deposit) + possibly a fresh recipient balance row.
+        NativeFeeKind::TransferNonFungible => count + 1,
+        // Per instance: owner row + lookup row + the instance state rows holding ROM/RAM
+        // (1 KiB quanta), plus possibly a fresh recipient balance row.
+        NativeFeeKind::MintNonFungible => count * (2 + (rom_ram_bytes as u64).div_ceil(1024)) + 1,
+        NativeFeeKind::BurnFungible | NativeFeeKind::BurnNonFungible => 0,
+        // Token info + symbol lookup + supply/config rows, metadata-dependent.
+        NativeFeeKind::CreateToken => 8,
+        NativeFeeKind::CreateTokenSeries => 4,
+        // name->address and address->name rows.
+        NativeFeeKind::RegisterName => 2,
+        NativeFeeKind::Script => 4,
+    }
+}
+
+// Conservative single-witness envelope defaults per kind; used only when the caller did not
+// measure the real signed size. Generous by design: under v2 an oversized estimate only raises
+// the refunded offer, never the settled bill.
+fn default_envelope_bytes(kind: NativeFeeKind, count: u64, rom_ram_bytes: u32) -> u64 {
+    match kind {
+        NativeFeeKind::TransferFungible
+        | NativeFeeKind::MintFungible
+        | NativeFeeKind::BurnFungible
+        | NativeFeeKind::RegisterName => 512,
+        // 8 bytes per carried instance id.
+        NativeFeeKind::TransferNonFungible | NativeFeeKind::BurnNonFungible => 512 + 8 * count,
+        // ROM/RAM ride the envelope.
+        NativeFeeKind::MintNonFungible => 512 + count * (64 + rom_ram_bytes as u64),
+        // Token metadata (icons, descriptions) dominates.
+        NativeFeeKind::CreateToken => 4096,
+        NativeFeeKind::CreateTokenSeries => 2048,
+        NativeFeeKind::Script => 1024,
+    }
+}
+
+fn round_up(value: u64, step: u64) -> u64 {
+    value.div_ceil(step) * step
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

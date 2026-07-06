@@ -231,6 +231,7 @@ fn chain_gas_token_and_market_config_wire_formats_match_python() {
         gas_fee_register_name: 17,
         gas_burn_ratio_mul: 18,
         gas_burn_ratio_shift: 19,
+        ..GasConfig::default()
     };
     let raw = serialize(&gas).unwrap();
     assert_eq!(raw.len(), 113);

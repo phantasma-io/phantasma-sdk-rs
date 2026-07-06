@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 
 use crate::carbon::{
     parse_create_token_result, parse_create_token_series_result, serialize, sign_tx_msg, Bytes32,
-    SignedTxMsg, TxMsg,
+    GasConfig, SignedTxMsg, TxMsg,
 };
 use crate::crypto::PhantasmaKeys;
 use crate::encoding::{decode_hex, encode_hex};
@@ -378,6 +378,13 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
     pub async fn get_chain(&self, chain: &str, extended: bool) -> Result<ChainResult> {
         self.call("getChain", vec![json!(chain), json!(extended)])
             .await
+    }
+
+    /// Current on-chain gas configuration plus fee-estimation chain parameters. Changes only
+    /// via governance resolutions, so the result is safe to cache. Feed
+    /// [`GasConfigResult::to_gas_config`] into `estimate_native_fee` for Tier-1 fee estimates.
+    pub async fn get_gas_config(&self) -> Result<GasConfigResult> {
+        self.call("getGasConfig", vec![]).await
     }
 
     pub async fn get_nexus(&self, extended: bool) -> Result<NexusResult> {
@@ -1733,6 +1740,156 @@ pub struct ChainResult {
     pub organization: Option<String>,
     pub contracts: Option<Vec<String>>,
     pub dapps: Option<Vec<String>>,
+}
+
+/// getGasConfig response: the current on-chain gas configuration plus the chain parameters
+/// fee estimation needs. 64-bit config values ride as decimal strings on the wire (they can
+/// exceed the 2^53 precision of JSON numbers in JavaScript-facing tooling).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GasConfigResult {
+    /// 1 = original fee model, 2 = gas-model-v2 (config version >= 1).
+    pub gas_model_version: u32,
+    pub gas_config: Option<GasConfigDataResult>,
+    /// Chain block rate target in milliseconds.
+    pub block_rate_target: u32,
+    /// Transaction expiry window in milliseconds.
+    pub expiry_window: u32,
+    /// Gas-model-v2 price of block-carried bytes in gas units per byte; absent under v1.
+    pub units_per_block_data_byte: Option<u32>,
+}
+
+/// JSON shape of the on-chain GasConfig. Fields after gas_burn_ratio_shift exist only when the
+/// config version is >= 1 (gas-model-v2) and are omitted from v1 responses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GasConfigDataResult {
+    pub version: u8,
+    pub max_name_length: u8,
+    pub max_token_symbol_length: u8,
+    pub fee_shift: u8,
+    pub max_structure_size: u32,
+    pub fee_multiplier: Option<String>,
+    pub gas_token_id: Option<String>,
+    pub data_token_id: Option<String>,
+    pub minimum_gas_offer: Option<String>,
+    pub data_escrow_per_row: Option<String>,
+    pub gas_fee_transfer: Option<String>,
+    pub gas_fee_query: Option<String>,
+    pub gas_fee_create_token_base: Option<String>,
+    pub gas_fee_create_token_symbol: Option<String>,
+    pub gas_fee_create_token_series: Option<String>,
+    pub gas_fee_per_byte: Option<String>,
+    pub gas_fee_register_name: Option<String>,
+    pub gas_burn_ratio_mul: Option<String>,
+    pub gas_burn_ratio_shift: u8,
+    pub minimum_gas_bill: Option<String>,
+    pub gas_producer_ratio_mul: Option<String>,
+    pub gas_producer_ratio_shift: Option<u8>,
+    pub gas_dapp_ratio_mul: Option<String>,
+    pub gas_dapp_ratio_shift: Option<u8>,
+    pub policy_fee_create_token_base: Option<String>,
+    pub policy_fee_create_token_symbol: Option<String>,
+    pub policy_fee_create_token_series: Option<String>,
+    pub policy_fee_register_name: Option<String>,
+    pub legacy_data_escrow_per_row: Option<String>,
+}
+
+impl GasConfigResult {
+    /// Converts to the wire-format [`GasConfig`] consumed by `estimate_native_fee`. Errors on
+    /// malformed numeric strings and on a v2 response missing tail fields: estimating fees
+    /// from silently zeroed v2 prices would produce rejected transactions.
+    pub fn to_gas_config(&self) -> Result<GasConfig> {
+        let data = self
+            .gas_config
+            .as_ref()
+            .ok_or_else(|| PhantasmaError::Rpc {
+                code: None,
+                message: "getGasConfig response has no gasConfig section".into(),
+            })?;
+        let mut config = GasConfig {
+            version: data.version,
+            max_name_length: data.max_name_length,
+            max_token_symbol_length: data.max_token_symbol_length,
+            fee_shift: data.fee_shift,
+            max_structure_size: data.max_structure_size,
+            fee_multiplier: parse_u64_field(&data.fee_multiplier, "feeMultiplier")?,
+            gas_token_id: parse_u64_field(&data.gas_token_id, "gasTokenId")?,
+            data_token_id: parse_u64_field(&data.data_token_id, "dataTokenId")?,
+            minimum_gas_offer: parse_u64_field(&data.minimum_gas_offer, "minimumGasOffer")?,
+            data_escrow_per_row: parse_u64_field(&data.data_escrow_per_row, "dataEscrowPerRow")?,
+            gas_fee_transfer: parse_u64_field(&data.gas_fee_transfer, "gasFeeTransfer")?,
+            gas_fee_query: parse_u64_field(&data.gas_fee_query, "gasFeeQuery")?,
+            gas_fee_create_token_base: parse_u64_field(
+                &data.gas_fee_create_token_base,
+                "gasFeeCreateTokenBase",
+            )?,
+            gas_fee_create_token_symbol: parse_u64_field(
+                &data.gas_fee_create_token_symbol,
+                "gasFeeCreateTokenSymbol",
+            )?,
+            gas_fee_create_token_series: parse_u64_field(
+                &data.gas_fee_create_token_series,
+                "gasFeeCreateTokenSeries",
+            )?,
+            gas_fee_per_byte: parse_u64_field(&data.gas_fee_per_byte, "gasFeePerByte")?,
+            gas_fee_register_name: parse_u64_field(
+                &data.gas_fee_register_name,
+                "gasFeeRegisterName",
+            )?,
+            gas_burn_ratio_mul: parse_u64_field(&data.gas_burn_ratio_mul, "gasBurnRatioMul")?,
+            gas_burn_ratio_shift: data.gas_burn_ratio_shift,
+            ..GasConfig::default()
+        };
+        if config.version >= 1 {
+            config.minimum_gas_bill = parse_u64_field(&data.minimum_gas_bill, "minimumGasBill")?;
+            config.gas_producer_ratio_mul =
+                parse_u64_field(&data.gas_producer_ratio_mul, "gasProducerRatioMul")?;
+            config.gas_producer_ratio_shift = data
+                .gas_producer_ratio_shift
+                .ok_or_else(|| missing_gas_config_field("gasProducerRatioShift"))?;
+            config.gas_dapp_ratio_mul =
+                parse_u64_field(&data.gas_dapp_ratio_mul, "gasDappRatioMul")?;
+            config.gas_dapp_ratio_shift = data
+                .gas_dapp_ratio_shift
+                .ok_or_else(|| missing_gas_config_field("gasDappRatioShift"))?;
+            config.policy_fee_create_token_base = parse_u64_field(
+                &data.policy_fee_create_token_base,
+                "policyFeeCreateTokenBase",
+            )?;
+            config.policy_fee_create_token_symbol = parse_u64_field(
+                &data.policy_fee_create_token_symbol,
+                "policyFeeCreateTokenSymbol",
+            )?;
+            config.policy_fee_create_token_series = parse_u64_field(
+                &data.policy_fee_create_token_series,
+                "policyFeeCreateTokenSeries",
+            )?;
+            config.policy_fee_register_name =
+                parse_u64_field(&data.policy_fee_register_name, "policyFeeRegisterName")?;
+            config.legacy_data_escrow_per_row =
+                parse_u64_field(&data.legacy_data_escrow_per_row, "legacyDataEscrowPerRow")?;
+        }
+        Ok(config)
+    }
+}
+
+fn parse_u64_field(value: &Option<String>, field_name: &str) -> Result<u64> {
+    let text = value
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| missing_gas_config_field(field_name))?;
+    text.parse::<u64>().map_err(|err| PhantasmaError::Rpc {
+        code: None,
+        message: format!("getGasConfig field {field_name}: {err}"),
+    })
+}
+
+fn missing_gas_config_field(field_name: &str) -> PhantasmaError {
+    PhantasmaError::Rpc {
+        code: None,
+        message: format!("getGasConfig field {field_name} is missing or empty"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
