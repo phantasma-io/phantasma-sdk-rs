@@ -209,8 +209,10 @@ fn chain_gas_token_and_market_config_wire_formats_match_python() {
     let decoded: ChainConfig = deserialize(serialize(&chain).unwrap()).unwrap();
     assert_eq!(decoded, chain);
 
+    // version=0: the 113-byte image is exactly the version-0 layout; version >= 1 configs
+    // append the gas-model-v2 tail on the wire (see tests/gas_config_fee.rs).
     let gas = GasConfig {
-        version: 1,
+        version: 0,
         max_name_length: 2,
         max_token_symbol_length: 3,
         fee_shift: 4,
@@ -232,7 +234,7 @@ fn chain_gas_token_and_market_config_wire_formats_match_python() {
     };
     let raw = serialize(&gas).unwrap();
     assert_eq!(raw.len(), 113);
-    assert_eq!(&hex::encode(&raw[..8]), "0102030405000000");
+    assert_eq!(&hex::encode(&raw[..8]), "0002030405000000");
     assert_eq!(&hex::encode(&raw[raw.len() - 9..]), "120000000000000013");
     let decoded: GasConfig = deserialize(raw).unwrap();
     assert_eq!(decoded, gas);
