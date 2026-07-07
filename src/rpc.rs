@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 
 use crate::carbon::{
     parse_create_token_result, parse_create_token_series_result, serialize, sign_tx_msg, Bytes32,
-    GasConfig, SignedTxMsg, TxMsg,
+    GasConfig, NativeFeeEstimate, SignedTxMsg, TxMsg,
 };
 use crate::crypto::PhantasmaKeys;
 use crate::encoding::{decode_hex, encode_hex};
@@ -385,6 +385,16 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
     /// [`GasConfigResult::to_gas_config`] into `estimate_native_fee` for Tier-1 fee estimates.
     pub async fn get_gas_config(&self) -> Result<GasConfigResult> {
         self.call("getGasConfig", vec![]).await
+    }
+
+    /// Dry-runs a serialized transaction envelope against current chain state and returns its
+    /// exact fee bill with recommended max_gas/max_data ceilings (gas-model-v2 Tier-2 estimate).
+    /// Signatures inside the envelope may be zero-filled dummies of the correct length - the
+    /// simulation skips signature checks, and dummies preserve the exact envelope byte length the
+    /// bill depends on. Until the estimate service is launched this returns a standard RPC error;
+    /// use `estimate_native_fee` with [`Self::get_gas_config`] as the fallback.
+    pub async fn estimate_transaction(&self, tx_data: &str) -> Result<EstimateTransactionResult> {
+        self.call("estimateTransaction", vec![json!(tx_data)]).await
     }
 
     pub async fn get_nexus(&self, extended: bool) -> Result<NexusResult> {
@@ -1890,6 +1900,75 @@ fn missing_gas_config_field(field_name: &str) -> PhantasmaError {
         code: None,
         message: format!("getGasConfig field {field_name} is missing or empty"),
     }
+}
+
+/// estimateTransaction response: the exact fee bill of one serialized transaction envelope,
+/// computed by dry-running it against current chain state (gas-model-v2 Tier-2). 64-bit amounts
+/// ride as decimal strings on the wire (they can exceed the 2^53 precision of JSON numbers in
+/// JavaScript-facing tooling). Amounts are kcal-base atoms of the gas token; escrow amounts are
+/// data-token atoms. Service availability (routing, gas model, node budget) surfaces as a
+/// standard RPC error, never through this shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct EstimateTransactionResult {
+    /// True when the transaction would not complete on-chain as submitted; see `abort_reason`.
+    pub would_abort: bool,
+    /// Rejection or abort reason when `would_abort` is true; empty otherwise.
+    pub abort_reason: String,
+    /// Settled gas bill in kcal-base, including the minimum-bill floor and the max_gas clamp
+    /// (aborted transactions still pay).
+    pub gas_bill_kcal_base: Option<String>,
+    /// Newly paid storage quanta the transaction creates
+    /// (`data_rows` * dataEscrowPerRow == `data_escrow_atoms`).
+    pub data_rows: Option<String>,
+    /// Gross storage escrow paid for grown rows, in data-token atoms.
+    pub data_escrow_atoms: Option<String>,
+    /// Gross storage refunds for shrunk rows, in data-token atoms.
+    pub data_refund_atoms: Option<String>,
+    /// Recommended TxMsg max_gas: the bill plus a 15% state-drift margin, floored at the chain
+    /// minimums; "0" when `would_abort`.
+    pub recommended_max_gas: Option<String>,
+    /// Recommended TxMsg max_data: the net escrow plus a 15% margin, aligned up to whole rows;
+    /// "0" when `would_abort` or nothing is escrowed.
+    pub recommended_max_data: Option<String>,
+}
+
+impl EstimateTransactionResult {
+    /// Converts a completed estimate into the same [`NativeFeeEstimate`] the Tier-1 estimator
+    /// produces, so wallet code consumes both tiers identically: `max_gas`/`max_data` are the
+    /// recommended ceilings and `expected_gas_bill` is the exact settled bill. Errors when
+    /// `would_abort` is set - an aborted simulation has no recommendations (retry with a higher
+    /// offer or fall back to the Tier-1 estimator) - and on malformed numeric strings.
+    pub fn to_fee_estimate(&self) -> Result<NativeFeeEstimate> {
+        if self.would_abort {
+            return Err(PhantasmaError::Rpc {
+                code: None,
+                message: format!(
+                    "estimateTransaction reported the transaction would abort: {}",
+                    self.abort_reason
+                ),
+            });
+        }
+        Ok(NativeFeeEstimate {
+            max_gas: parse_estimate_u64(&self.recommended_max_gas, "recommendedMaxGas")?,
+            max_data: parse_estimate_u64(&self.recommended_max_data, "recommendedMaxData")?,
+            expected_gas_bill: parse_estimate_u64(&self.gas_bill_kcal_base, "gasBillKcalBase")?,
+        })
+    }
+}
+
+fn parse_estimate_u64(value: &Option<String>, field_name: &str) -> Result<u64> {
+    let text = value
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| PhantasmaError::Rpc {
+            code: None,
+            message: format!("estimateTransaction field {field_name} is missing or empty"),
+        })?;
+    text.parse::<u64>().map_err(|err| PhantasmaError::Rpc {
+        code: None,
+        message: format!("estimateTransaction field {field_name}: {err}"),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
