@@ -1655,6 +1655,11 @@ pub struct BlockResult {
     pub protocol: u32,
     pub txs: Vec<TransactionResult>,
     pub validator_address: String,
+    /// Fee payout address stamped by the block producer inside the hashed block input. `Some` on
+    /// gas-model-v2 blocks, `None` on earlier blocks. Distinct from `validator_address` (the
+    /// consensus-log leader): usually equal today, but a configurable payout address is a planned
+    /// compatible extension, so consumers must not assume equality.
+    pub producer_address: Option<String>,
     pub reward: String,
     pub events: Option<Vec<EventResult>>,
     pub oracles: Option<Vec<OracleResult>>,

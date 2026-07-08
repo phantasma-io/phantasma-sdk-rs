@@ -694,6 +694,22 @@ fn rpc_dtos_decode_current_response_shapes_without_stale_aliases() {
     assert_eq!(block.txs[0].hash, "TX1");
     assert_eq!(block.events, None);
     assert_eq!(block.oracles, None);
+    // Pre-gas-model-v2 block: the producerAddress key is omitted, so serde default yields None.
+    assert_eq!(block.producer_address, None);
+
+    // Gas-model-v2 block: producerAddress is present and decodes verbatim; distinct in meaning
+    // from validator_address (the consensus-log leader).
+    let v2_block: phantasma_sdk::BlockResult = serde_json::from_value(json!({
+        "hash": "ABCD",
+        "height": 43,
+        "validatorAddress": "PVALIDATOR",
+        "producerAddress": "PPRODUCER",
+        "reward": "0",
+        "txs": []
+    }))
+    .unwrap();
+    assert_eq!(v2_block.validator_address, "PVALIDATOR");
+    assert_eq!(v2_block.producer_address, Some("PPRODUCER".to_string()));
 
     let balance: phantasma_sdk::BalanceResult = serde_json::from_value(json!({
         "chain": "main",
