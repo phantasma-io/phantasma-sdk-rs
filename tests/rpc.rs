@@ -1058,3 +1058,56 @@ fn parse_json_rpc_response_surfaces_http_rejections() {
     let err = parse_json_rpc_response_for_request(429, json!({}), 7).unwrap_err();
     assert_rpc_error_message(err, "HTTP 429");
 }
+
+#[tokio::test]
+async fn get_account_info_sends_only_the_account() {
+    let transport = MockTransport::with_response((
+        200,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "address": "P2Kaccount",
+                "name": "myname",
+                "stake": {"amount": "1500000000000", "time": 1743520000, "unclaimed": "42000000000"}
+            }
+        }),
+    ));
+    let client = PhantasmaRpc::with_transport("http://localhost:5172/rpc", transport.clone());
+
+    let account = client.get_account_info("P2Kaccount").await.unwrap();
+
+    // The endpoint exists so wallets can refresh at a cost independent of account size; sending any
+    // extra argument here would silently change which overload the node dispatches.
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["method"], "getAccountInfo");
+    assert_eq!(requests[0]["params"], json!(["P2Kaccount"]));
+
+    // getAccountInfo names the staking object `stake`, while getAccount carries the same object
+    // under `stakes` and uses `stake` for a deprecated flat scalar; binding the wrong one would
+    // deserialize into a default (zeroed) stake instead of failing loudly.
+    assert_eq!(account.address, "P2Kaccount");
+    assert_eq!(account.name, "myname");
+    assert_eq!(account.stake.amount, "1500000000000");
+    assert_eq!(account.stake.time, 1743520000);
+    assert_eq!(account.stake.unclaimed, "42000000000");
+}
+
+#[tokio::test]
+async fn get_account_info_with_address_type_forwards_address_interpretation() {
+    let transport = MockTransport::with_response((
+        200,
+        json!({"jsonrpc": "2.0", "id": "1", "result": {"address": "001122", "name": "anonymous"}}),
+    ));
+    let client = PhantasmaRpc::with_transport("http://localhost:5172/rpc", transport.clone());
+
+    client
+        .get_account_info_with_address_type("001122", false, "Carbon")
+        .await
+        .unwrap();
+
+    let requests = transport.requests();
+    assert_eq!(requests[0]["method"], "getAccountInfo");
+    assert_eq!(requests[0]["params"], json!(["001122", false, "Carbon"]));
+}

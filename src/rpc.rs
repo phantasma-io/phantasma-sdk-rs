@@ -294,6 +294,33 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         self.call("getVersion", vec![]).await
     }
 
+    /// Returns the account name and staking info for an address.
+    ///
+    /// Cost is independent of how much the address holds, which makes this the call to use in wallet
+    /// refresh loops; balances and NFTs are fetched separately through the cursor-paginated account
+    /// endpoints.
+    pub async fn get_account_info(&self, address: &str) -> Result<AccountInfoResult> {
+        self.call("getAccountInfo", vec![json!(address)]).await
+    }
+
+    /// Returns the account overview with explicit address interpretation.
+    pub async fn get_account_info_with_address_type(
+        &self,
+        address: &str,
+        check_address_reserved_byte: bool,
+        address_type: &str,
+    ) -> Result<AccountInfoResult> {
+        self.call(
+            "getAccountInfo",
+            vec![
+                json!(address),
+                json!(check_address_reserved_byte),
+                json!(address_type),
+            ],
+        )
+        .await
+    }
+
     pub async fn get_account(&self, address: &str) -> Result<AccountResult> {
         self.call("getAccount", vec![json!(address), json!(false)])
             .await
@@ -1507,6 +1534,23 @@ pub struct StorageResult {
     pub used: u64,
     pub avatar: String,
     pub archives: Vec<ArchiveResult>,
+}
+
+/// Lightweight account overview returned by `getAccountInfo`.
+///
+/// Carries no balances and no NFT id lists, so fetching it costs the same regardless of how much an
+/// address holds - unlike [`AccountResult`], whose `balances[].ids` embed every owned NFT id and are
+/// capped server-side at 10000 entries per token. Balances and NFTs are fetched separately through
+/// the cursor-paginated account endpoints.
+///
+/// Note the wire name of the staking object differs from [`AccountResult`], which carries the same
+/// object under `stakes` and uses `stake` for a deprecated flat scalar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AccountInfoResult {
+    pub address: String,
+    pub name: String,
+    pub stake: StakeResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
