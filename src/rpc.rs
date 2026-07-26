@@ -419,6 +419,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         self.call("getPlatforms", vec![]).await
     }
 
+    /// The `extended` flag is deprecated server-side and slated for removal.
     pub async fn get_chains(&self, extended: bool) -> Result<Vec<ChainResult>> {
         self.call("getChains", vec![json!(extended)]).await
     }
@@ -614,6 +615,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
             .await
     }
 
+    /// The `extended` flag is deprecated server-side and slated for removal.
     pub async fn get_contracts(&self, chain: &str, extended: bool) -> Result<Vec<ContractResult>> {
         self.call("getContracts", vec![json!(chain), json!(extended)])
             .await
@@ -706,6 +708,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         .await
     }
 
+    /// The `extended` flag is deprecated server-side and slated for removal.
     pub async fn get_tokens(&self, extended: bool) -> Result<Vec<TokenResult>> {
         self.call("getTokens", vec![json!(extended)]).await
     }
@@ -741,6 +744,10 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
             .collect())
     }
 
+    #[deprecated(
+        since = "1.6.0",
+        note = "getTokenData is a strict subset of getNFT (same response, property loading forced off); use get_nft"
+    )]
     pub async fn get_token_data(&self, symbol: &str, token_id: &str) -> Result<TokenDataResult> {
         self.call("getTokenData", vec![json!(symbol), json!(token_id)])
             .await
