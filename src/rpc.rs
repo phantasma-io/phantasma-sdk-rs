@@ -321,11 +321,19 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         .await
     }
 
+    #[deprecated(
+        since = "1.6.0",
+        note = "getAccount embeds every owned NFT id (server-capped at 10000 per token while amount keeps the true count); use get_account_info with get_account_fungible_tokens/get_account_nfts"
+    )]
     pub async fn get_account(&self, address: &str) -> Result<AccountResult> {
         self.call("getAccount", vec![json!(address), json!(false)])
             .await
     }
 
+    #[deprecated(
+        since = "1.6.0",
+        note = "see get_account; use get_account_info with get_account_fungible_tokens/get_account_nfts"
+    )]
     pub async fn get_account_with_address_type(
         &self,
         address: &str,
@@ -345,6 +353,11 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         .await
     }
 
+    #[deprecated(
+        since = "1.6.0",
+        note = "getAccounts embeds every owned NFT id (server-capped at 10000 per token while amount keeps the true count); use get_account_info with get_account_fungible_tokens/get_account_nfts"
+    )]
+    #[allow(deprecated)]
     pub async fn get_accounts<S: AsRef<str> + Sync>(
         &self,
         addresses: &[S],
@@ -358,6 +371,10 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         self.get_accounts_text(&text, extended).await
     }
 
+    #[deprecated(
+        since = "1.6.0",
+        note = "getAccounts embeds every owned NFT id (server-capped at 10000 per token while amount keeps the true count); use get_account_info with get_account_fungible_tokens/get_account_nfts"
+    )]
     pub async fn get_accounts_text(
         &self,
         addresses: &str,
@@ -367,6 +384,10 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
             .await
     }
 
+    #[deprecated(
+        since = "1.6.0",
+        note = "getAccounts embeds every owned NFT id (server-capped at 10000 per token while amount keeps the true count); use get_account_info with get_account_fungible_tokens/get_account_nfts"
+    )]
     pub async fn get_accounts_with_address_type(
         &self,
         addresses: &str,
