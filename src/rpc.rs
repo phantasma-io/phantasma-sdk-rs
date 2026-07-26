@@ -631,6 +631,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         .await
     }
 
+    /// `page_size` must be 1..100; the node rejects anything outside that range.
     pub async fn get_organizations(
         &self,
         page_size: u32,
@@ -644,6 +645,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         .await
     }
 
+    /// `page_size` must be 1..100; the node rejects anything outside that range.
     pub async fn get_organization_members(
         &self,
         name: &str,
@@ -798,6 +800,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         .await
     }
 
+    /// `page_size` must be 1..100; the node rejects anything outside that range.
     pub async fn get_token_series(
         &self,
         symbol: &str,
@@ -844,6 +847,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         .await
     }
 
+    /// `page_size` must be 1..100, or 1..50 when `extended` is true; the node rejects anything else.
     pub async fn get_token_nfts(
         &self,
         carbon_token_id: u64,
@@ -888,6 +892,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `page_size` must be 1..100; the node rejects anything outside that range.
     pub async fn get_account_fungible_tokens(
         &self,
         address: &str,
@@ -912,6 +917,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `page_size` must be 1..100; the node rejects anything outside that range.
     pub async fn get_account_fungible_tokens_with_address_type(
         &self,
         address: &str,
@@ -938,6 +944,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `page_size` must be 1..100, or 1..50 when `extended` is true; the node rejects anything else.
     pub async fn get_account_nfts(
         &self,
         address: &str,
@@ -966,6 +973,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `page_size` must be 1..100, or 1..50 when `extended` is true; the node rejects anything else.
     pub async fn get_account_nfts_with_address_type(
         &self,
         address: &str,
@@ -995,6 +1003,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         .await
     }
 
+    /// `page_size` must be 1..100; the node rejects anything outside that range.
     pub async fn get_account_owned_tokens(
         &self,
         address: &str,
@@ -1019,6 +1028,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `page_size` must be 1..100; the node rejects anything outside that range.
     pub async fn get_account_owned_tokens_with_address_type(
         &self,
         address: &str,
@@ -1044,6 +1054,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         .await
     }
 
+    /// `page_size` must be 1..100; the node rejects anything outside that range.
     pub async fn get_account_owned_token_series(
         &self,
         address: &str,
@@ -1068,6 +1079,7 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `page_size` must be 1..100; the node rejects anything outside that range.
     pub async fn get_account_owned_token_series_with_address_type(
         &self,
         address: &str,
