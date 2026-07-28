@@ -1111,3 +1111,68 @@ async fn get_account_info_with_address_type_forwards_address_interpretation() {
     assert_eq!(requests[0]["method"], "getAccountInfo");
     assert_eq!(requests[0]["params"], json!(["001122", false, "Carbon"]));
 }
+
+// The batch contract is a NATIVE JSON array parameter (Solana getMultipleAccounts style), not the
+// comma-joined string the deprecated getAccounts wire used; results decode per element with the
+// same stake-vs-stakes nuance and keep request order.
+#[tokio::test]
+async fn get_account_infos_sends_native_array_and_keeps_order() {
+    let transport = MockTransport::with_response((
+        200,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": [
+                {
+                    "address": "P2Kaccount1",
+                    "name": "anonymous",
+                    "stake": {"amount": "0", "time": 0, "unclaimed": "0"}
+                },
+                {
+                    "address": "P2Kaccount2",
+                    "name": "myname",
+                    "stake": {"amount": "1500000000000", "time": 1743520000, "unclaimed": "42000000000"}
+                }
+            ]
+        }),
+    ));
+    let client = PhantasmaRpc::with_transport("http://localhost:5172/rpc", transport.clone());
+
+    let accounts = client
+        .get_account_infos(&["P2Kaccount1", "P2Kaccount2"])
+        .await
+        .unwrap();
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["method"], "getAccountInfos");
+    assert_eq!(
+        requests[0]["params"],
+        json!([["P2Kaccount1", "P2Kaccount2"]])
+    );
+
+    assert_eq!(accounts.len(), 2);
+    assert_eq!(accounts[0].address, "P2Kaccount1");
+    assert_eq!(accounts[0].name, "anonymous");
+    assert_eq!(accounts[0].stake.amount, "0");
+    assert_eq!(accounts[1].address, "P2Kaccount2");
+    assert_eq!(accounts[1].name, "myname");
+    assert_eq!(accounts[1].stake.amount, "1500000000000");
+    assert_eq!(accounts[1].stake.unclaimed, "42000000000");
+}
+
+#[tokio::test]
+async fn get_account_infos_with_address_type_forwards_address_interpretation() {
+    let transport =
+        MockTransport::with_response((200, json!({"jsonrpc": "2.0", "id": "1", "result": []})));
+    let client = PhantasmaRpc::with_transport("http://localhost:5172/rpc", transport.clone());
+
+    client
+        .get_account_infos_with_address_type(&["001122"], false, "Carbon")
+        .await
+        .unwrap();
+
+    let requests = transport.requests();
+    assert_eq!(requests[0]["method"], "getAccountInfos");
+    assert_eq!(requests[0]["params"], json!([["001122"], false, "Carbon"]));
+}

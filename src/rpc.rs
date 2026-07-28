@@ -321,6 +321,39 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         .await
     }
 
+    /// Returns account overviews for a batch of up to 100 addresses in one call.
+    ///
+    /// Batch counterpart of [`get_account_info`](Self::get_account_info) with the same per-account
+    /// record: the node answers every address from a single state snapshot and returns results in
+    /// request order. The addresses travel as a native JSON array parameter; a malformed address
+    /// rejects the whole batch.
+    pub async fn get_account_infos<S: AsRef<str> + Sync>(
+        &self,
+        addresses: &[S],
+    ) -> Result<Vec<AccountInfoResult>> {
+        let addresses: Vec<&str> = addresses.iter().map(AsRef::as_ref).collect();
+        self.call("getAccountInfos", vec![json!(addresses)]).await
+    }
+
+    /// Returns the batch account overview with explicit address interpretation.
+    pub async fn get_account_infos_with_address_type<S: AsRef<str> + Sync>(
+        &self,
+        addresses: &[S],
+        check_address_reserved_byte: bool,
+        address_type: &str,
+    ) -> Result<Vec<AccountInfoResult>> {
+        let addresses: Vec<&str> = addresses.iter().map(AsRef::as_ref).collect();
+        self.call(
+            "getAccountInfos",
+            vec![
+                json!(addresses),
+                json!(check_address_reserved_byte),
+                json!(address_type),
+            ],
+        )
+        .await
+    }
+
     #[deprecated(
         since = "1.6.0",
         note = "getAccount embeds every owned NFT id (server-capped at 10000 per token while amount keeps the true count); use get_account_info with get_account_fungible_tokens/get_account_nfts"
