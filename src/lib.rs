@@ -10,6 +10,7 @@ pub mod carbon;
 pub mod crypto;
 pub mod encoding;
 pub mod error;
+pub mod extended_events;
 pub mod rpc;
 pub mod transaction;
 pub mod vm;
@@ -24,6 +25,7 @@ pub use crypto::{
 };
 pub use encoding::{decode_base58, decode_hex, encode_base58, encode_hex, encode_hex_upper};
 pub use error::{PhantasmaError, Result};
+pub use extended_events::*;
 pub use rpc::*;
 pub use transaction::{tx_state_is_fault, tx_state_is_success, Transaction, SDK_PAYLOAD};
 pub use vm::{Opcode, ScriptArg, ScriptBuilder, VMObject};

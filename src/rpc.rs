@@ -25,6 +25,7 @@ use crate::carbon::{
 use crate::crypto::PhantasmaKeys;
 use crate::encoding::{decode_hex, encode_hex};
 use crate::error::{rpc, PhantasmaError, Result};
+use crate::extended_events::EventData;
 use crate::transaction::{tx_state_is_fault, tx_state_is_success, Transaction};
 use crate::vm::VMObject;
 
@@ -1702,13 +1703,45 @@ pub struct EventResult {
     pub data: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(default, rename_all = "camelCase")]
+/// One extended event of a transaction answer.
+///
+/// `data` is typed during deserialization: the event's `kind` picks the concrete shape, and a
+/// kind or payload outside the modeled set stays raw in [`EventData::Unknown`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct EventExResult {
     pub address: String,
     pub contract: String,
     pub kind: String,
-    pub data: Value,
+    pub data: EventData,
+}
+
+impl<'de> Deserialize<'de> for EventExResult {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        // The kind picks the shape of data, so the two fields have to be read together; serde
+        // derives cannot dispatch on a sibling field.
+        let value = Value::deserialize(deserializer)?;
+        let Value::Object(mut object) = value else {
+            return Ok(Self::default());
+        };
+        fn text(object: &serde_json::Map<String, Value>, name: &str) -> String {
+            object
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        }
+        let kind = text(&object, "kind");
+        let data = match object.remove("data") {
+            Some(data) => EventData::from_kind_and_json(&kind, data),
+            None => EventData::default(),
+        };
+        Ok(Self {
+            address: text(&object, "address"),
+            contract: text(&object, "contract"),
+            kind,
+            data,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

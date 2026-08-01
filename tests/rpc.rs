@@ -346,10 +346,11 @@ async fn typed_raw_block_call_preserves_sdk_value_and_response_metadata() {
     assert_eq!(result.value.txs[0].carbon_tx_data, "BEEF");
     assert_eq!(result.value.txs[0].events[0].name, "GasEscrow");
     assert_eq!(result.value.txs[0].extended_events[0].kind, "TokenCreate");
-    assert_eq!(
-        result.value.txs[0].extended_events[0].data["symbol"],
-        "SOUL"
-    );
+    let created = result.value.txs[0].extended_events[0]
+        .data
+        .as_token_create()
+        .expect("TokenCreate data decodes to its typed shape");
+    assert_eq!(created.symbol, "SOUL");
     assert_eq!(result.raw_result["hash"], "ABCD");
     assert_eq!(result.raw_envelope["result"]["hash"], "ABCD");
     assert_eq!(result.endpoint, "http://localhost:5172/rpc");
@@ -652,7 +653,13 @@ fn rpc_dtos_decode_current_response_shapes_without_stale_aliases() {
     assert_eq!(tx_result.gas_price, "1");
     assert_eq!(tx_result.gas_limit, "2100000000");
     assert_eq!(tx_result.events[0].name, "GasEscrow");
-    assert_eq!(tx_result.extended_events[0].data["symbol"], "CROWN");
+    // TokenMint is not one of the kinds the node emits with extended data, so the payload stays
+    // verbatim in the Unknown variant.
+    let unknown = tx_result.extended_events[0]
+        .data
+        .as_unknown()
+        .expect("an unmodeled kind keeps its raw payload");
+    assert_eq!(unknown["symbol"], "CROWN");
     assert_eq!(tx_result.debug_comment, None);
 
     let mut tx_with_debug = tx;
