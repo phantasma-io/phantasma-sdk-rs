@@ -23,7 +23,9 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
 - JSON-RPC: async client, injectable transport for tests, read methods for common
   account/block/token/NFT/archive/contract/state calls, send helpers for VM
   script and Carbon transactions, response DTOs with serde defaults and scalar
-  coercion for reference RPC response quirks.
+  coercion for reference RPC response quirks. Token, series, NFT and organization
+  property values decode into `VmValue`, keeping the scalar, array or struct shape
+  the node answers.
 
 ## Rust API Decisions
 
@@ -37,6 +39,12 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
   Rust names like `PhantasmaRpc`, `ModuleId`, and `AbiParameterResult`.
 - Python exception subclasses map to variants of `PhantasmaError`.
 - Async RPC is transport-generic so unit tests do not require a live node.
+- `VmValue` keeps every scalar as text: chain values are big integers, and parsing
+  them into a numeric type would either overflow or lose precision. Arrays and
+  structs keep their own shape instead of collapsing into a packed string.
+- Extended event data stays `serde_json::Value`. The C# and TypeScript SDKs model
+  the special-resolution call arguments per method; this crate has never modelled
+  extended events, so consumers read them as JSON until that surface is ported.
 - Examples avoid funded or broadcasting workflows unless the caller explicitly
   chooses to run a send method.
 
