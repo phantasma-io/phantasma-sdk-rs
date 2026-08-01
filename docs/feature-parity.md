@@ -26,6 +26,11 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
   coercion for reference RPC response quirks. Token, series, NFT and organization
   property values decode into `VmValue`, keeping the scalar, array or struct shape
   the node answers.
+- Extended events: `EventExResult.data` decodes into `EventData`, typed by the
+  event kind (token creation, series creation, market orders, special
+  resolutions). Special-resolution call arguments are typed per module and
+  method - the same 43 shapes the C# and TypeScript SDKs model - with `rawArgs`
+  fallback detection by content.
 
 ## Rust API Decisions
 
@@ -42,9 +47,22 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
 - `VmValue` keeps every scalar as text: chain values are big integers, and parsing
   them into a numeric type would either overflow or lose precision. Arrays and
   structs keep their own shape instead of collapsing into a packed string.
-- Extended event data stays `serde_json::Value`. The C# and TypeScript SDKs model
-  the special-resolution call arguments per method; this crate has never modelled
-  extended events, so consumers read them as JSON until that surface is ported.
+- Extended event data is a typed enum, not the C# `object`/TypeScript union:
+  Rust consumers pattern match on `EventData` and on the per-method
+  `SpecialResolutionArguments` instead of casting. Both enums keep unmodeled or
+  mismatched payloads verbatim (`EventData::Unknown`,
+  `SpecialResolutionArguments::Unrecognized`) where the C# converter returns
+  null for an unmodeled method - a deliberate divergence so a node newer than
+  this SDK never loses answered data, and decoding stays total (one unexpected
+  event cannot fail a whole block answer).
+- `TokenMintData` exists in the C# and TypeScript SDKs but is not ported: the
+  node does not emit a `TokenMint` extended event (no construction site in
+  RpcEventBuilder), so there is no wire shape to model. If the node starts
+  emitting it, the payload arrives in `EventData::Unknown` until the variant is
+  added.
+- Numeric fields follow the wire exactly: counts and big-integer ids are
+  strings, Carbon ids (`carbonTokenId`, `moduleId`, `resolutionId`) and
+  timestamps are JSON numbers mapped to `u64`/`u32`/`i64`.
 - Examples avoid funded or broadcasting workflows unless the caller explicitly
   chooses to run a send method.
 
@@ -64,6 +82,9 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
   Phantasma NFT helper paths.
 - `tests/rpc.rs` covers JSON-RPC request/response behavior through a mock
   transport.
+- `tests/extended_events.rs` covers typed extended-event decoding: kind
+  dispatch, the full 43-pair argument dispatch table, raw fallbacks, and wire
+  round-trips, with fixtures captured from devnet on 2026-08-01.
 
 Live localnet execution and funded/broadcasting examples are intentionally not
 part of the default test suite. The read-only RPC example can be run against an
