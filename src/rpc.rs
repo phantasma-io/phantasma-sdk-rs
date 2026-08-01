@@ -4,7 +4,7 @@
 //! higher-level wrappers inherit the same id checks, error extraction, scalar
 //! coercions, and transaction-hash handling.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -14,7 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use base64::Engine;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 
 use crate::carbon::{
@@ -2127,11 +2128,155 @@ pub struct LeaderboardResult {
     pub rows: Option<Vec<LeaderboardRowResult>>,
 }
 
+/// A value decoded from VM storage: a scalar, an array, or a struct.
+///
+/// VM values are dynamically typed, so the node answers the plain JSON value - a string, an array
+/// or an object - and the shape itself says which of the three it is. The value is never a JSON
+/// document packed into a string, which is what these answers used to carry.
+///
+/// Scalars are always text: chain numbers are big integers, so the node writes them as decimal
+/// strings, and byte values arrive as hex.
+///
+/// ```
+/// use phantasma_sdk::{TokenPropertyResult, VmValue};
+///
+/// let property: TokenPropertyResult = serde_json::from_str(
+///     r#"{"key":"_ia","value":[{"mul":"25","div":"10000"}]}"#,
+/// )
+/// .unwrap();
+/// let targets = property.value.as_items().unwrap();
+/// assert_eq!(targets[0].field("mul").and_then(VmValue::as_text), Some("25"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmValue {
+    /// A scalar: the whole value is this string.
+    Text(String),
+    /// An array of values.
+    Items(Vec<VmValue>),
+    /// A struct. Field names arrive exactly as the chain stores them - the node does not rename
+    /// dictionary keys.
+    Fields(BTreeMap<String, VmValue>),
+}
+
+impl VmValue {
+    /// Builds a scalar value.
+    pub fn text(value: impl Into<String>) -> Self {
+        VmValue::Text(value.into())
+    }
+
+    /// Returns the scalar content, or `None` for an array or a struct.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            VmValue::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Returns the array elements, or `None` for a scalar or a struct.
+    pub fn as_items(&self) -> Option<&[VmValue]> {
+        match self {
+            VmValue::Items(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Returns the struct fields, or `None` for a scalar or an array.
+    pub fn as_fields(&self) -> Option<&BTreeMap<String, VmValue>> {
+        match self {
+            VmValue::Fields(fields) => Some(fields),
+            _ => None,
+        }
+    }
+
+    /// Returns one field of a struct, or `None` for a scalar, an array, or a missing field.
+    pub fn field(&self, name: &str) -> Option<&VmValue> {
+        self.as_fields()?.get(name)
+    }
+
+    /// True when this is a scalar.
+    pub fn is_text(&self) -> bool {
+        matches!(self, VmValue::Text(_))
+    }
+
+    /// Maps a parsed JSON value onto the three VM shapes.
+    ///
+    /// Numbers and booleans are kept as their JSON text: the node writes every scalar as a string,
+    /// but a hand-written response - or one from an older node - can still carry them untyped, and
+    /// failing the whole response over that would be worse than normalizing it. An explicit `null`
+    /// becomes an empty scalar; the node omits empty values instead of answering null.
+    ///
+    /// Nesting depth is bounded by the JSON parser itself: serde_json rejects input nested deeper
+    /// than its own recursion limit before this ever runs.
+    fn from_json(value: Value) -> Self {
+        match value {
+            Value::Array(items) => {
+                VmValue::Items(items.into_iter().map(VmValue::from_json).collect())
+            }
+            Value::Object(fields) => VmValue::Fields(
+                fields
+                    .into_iter()
+                    .map(|(name, field)| (name, VmValue::from_json(field)))
+                    .collect(),
+            ),
+            Value::String(text) => VmValue::Text(text),
+            Value::Null => VmValue::Text(String::new()),
+            other => VmValue::Text(other.to_string()),
+        }
+    }
+}
+
+impl Default for VmValue {
+    fn default() -> Self {
+        VmValue::Text(String::new())
+    }
+}
+
+impl From<&str> for VmValue {
+    fn from(value: &str) -> Self {
+        VmValue::Text(value.to_string())
+    }
+}
+
+impl From<String> for VmValue {
+    fn from(value: String) -> Self {
+        VmValue::Text(value)
+    }
+}
+
+impl Serialize for VmValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            VmValue::Text(text) => serializer.serialize_str(text),
+            VmValue::Items(items) => {
+                let mut sequence = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    sequence.serialize_element(item)?;
+                }
+                sequence.end()
+            }
+            VmValue::Fields(fields) => {
+                let mut map = serializer.serialize_map(Some(fields.len()))?;
+                for (name, field) in fields {
+                    map.serialize_entry(name, field)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for VmValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        Ok(VmValue::from_json(Value::deserialize(deserializer)?))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct TokenPropertyResult {
     pub key: String,
-    pub value: String,
+    /// Decoded VM value: a scalar string, or the array/struct shape the value really has.
+    pub value: VmValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

@@ -673,11 +673,11 @@ fn rpc_dtos_decode_current_response_shapes_without_stale_aliases() {
     let stale_property: phantasma_sdk::TokenPropertyResult =
         serde_json::from_value(json!({"Key": "name", "Value": "Crown"})).unwrap();
     assert_eq!(stale_property.key, "");
-    assert_eq!(stale_property.value, "");
+    assert_eq!(stale_property.value.as_text(), Some(""));
     let current_property: phantasma_sdk::TokenPropertyResult =
         serde_json::from_value(json!({"key": "name", "value": "Crown"})).unwrap();
     assert_eq!(current_property.key, "name");
-    assert_eq!(current_property.value, "Crown");
+    assert_eq!(current_property.value.as_text(), Some("Crown"));
 
     let block: phantasma_sdk::BlockResult = serde_json::from_value(json!({
         "hash": "ABCD",
@@ -1175,4 +1175,102 @@ async fn get_account_infos_with_address_type_forwards_address_interpretation() {
     let requests = transport.requests();
     assert_eq!(requests[0]["method"], "getAccountInfos");
     assert_eq!(requests[0]["params"], json!([["001122"], false, "Carbon"]));
+}
+
+/// Token metadata rows carry a VM value, not a string: the SOUL response below is the answer
+/// devnet gave on 2026-08-01, where the inflation targets (`_ia`) are an array of structs and every
+/// other row is a scalar. A DTO holding `String` fails to deserialize this response outright.
+#[test]
+fn token_metadata_carries_vm_values_in_their_json_shape() {
+    let metadata = json!([
+        {
+            "key": "_ia",
+            "value": [
+                {
+                    "div": "10000",
+                    "mul": "25",
+                    "who": ["64D56AB3EA94769BDF30028DC00E9CC2077573DF6021DE1176738754B18A99A0"]
+                },
+                {
+                    "fix": "12500000000000",
+                    "who": ["0000000000000000000000000000000000000000000000030100000000000000"]
+                }
+            ]
+        },
+        {"key": "_ip", "value": "18446744073709551615"},
+        {"key": "name", "value": "Phantasma Stake"}
+    ]);
+    let token: phantasma_sdk::TokenResult = serde_json::from_value(json!({
+        "symbol": "SOUL",
+        "name": "Phantasma Stake",
+        "decimals": 8,
+        "currentSupply": "9151160937874318",
+        "maxSupply": "10000000000000000",
+        "burnedSupply": "848839062125682",
+        "address": "SADDR",
+        "owner": "SOWNER",
+        "flags": "Transferable, Burnable, Fungible, Divisible, Stakable",
+        "series": [],
+        "carbonId": "1",
+        "metadata": metadata.clone()
+    }))
+    .unwrap();
+
+    let rows = token.metadata.as_ref().unwrap();
+    let targets = rows[0].value.as_items().unwrap();
+    assert_eq!(targets.len(), 2);
+    assert_eq!(
+        targets[0]
+            .field("mul")
+            .and_then(phantasma_sdk::VmValue::as_text),
+        Some("25")
+    );
+    // The nested array inside the struct keeps its own shape instead of collapsing into text.
+    let recipients = targets[0]
+        .field("who")
+        .and_then(phantasma_sdk::VmValue::as_items);
+    assert_eq!(
+        recipients.map(|items| items[0].as_text()),
+        Some(Some(
+            "64D56AB3EA94769BDF30028DC00E9CC2077573DF6021DE1176738754B18A99A0"
+        ))
+    );
+    assert!(!rows[0].value.is_text());
+
+    // Scalars stay scalars, and big integers stay exact because they travel as text.
+    assert_eq!(rows[1].value.as_text(), Some("18446744073709551615"));
+    assert_eq!(rows[2].value.as_text(), Some("Phantasma Stake"));
+
+    // Writing the model back produces the same JSON the node sent - the value is the plain JSON
+    // shape, with nothing wrapping it.
+    assert_eq!(serde_json::to_value(rows).unwrap(), metadata);
+}
+
+/// Scalars that arrive untyped are normalized instead of failing the response: the node writes
+/// every scalar as a string, but an older node or a hand-written answer can still carry raw JSON
+/// numbers and booleans.
+#[test]
+fn vm_values_normalize_untyped_scalars() {
+    let property: phantasma_sdk::TokenPropertyResult =
+        serde_json::from_value(json!({"key": "_sbd", "value": 100})).unwrap();
+    assert_eq!(property.value.as_text(), Some("100"));
+
+    let flag: phantasma_sdk::TokenPropertyResult =
+        serde_json::from_value(json!({"key": "_flag", "value": true})).unwrap();
+    assert_eq!(flag.value.as_text(), Some("true"));
+
+    let empty: phantasma_sdk::TokenPropertyResult =
+        serde_json::from_value(json!({"key": "_none", "value": null})).unwrap();
+    assert_eq!(empty.value.as_text(), Some(""));
+
+    let nested: phantasma_sdk::TokenPropertyResult =
+        serde_json::from_value(json!({"key": "_mixed", "value": [{"n": 7}, "text"]})).unwrap();
+    let items = nested.value.as_items().unwrap();
+    assert_eq!(
+        items[0]
+            .field("n")
+            .and_then(phantasma_sdk::VmValue::as_text),
+        Some("7")
+    );
+    assert_eq!(items[1].as_text(), Some("text"));
 }
