@@ -3212,10 +3212,92 @@ impl CarbonSerializable for Witness {
     }
 }
 
+/// A transaction message with its witness signatures, in the envelope layout the chain reads:
+///
+/// - the native single-witness types append one bare 64-byte signature by `gas_from`;
+/// - the gas-payer types append two bare signatures: first the gas payer (`gas_from`), then the
+///   token owner (the payload's `from_address`), which the node resolves from the message rather
+///   than from the envelope;
+/// - Call, CallMulti, Trade and Phantasma append a length-prefixed array of (address, signature)
+///   witnesses composed by the caller;
+/// - PhantasmaRaw carries no witnesses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedTxMsg {
     pub msg: TxMsg,
     pub witnesses: Vec<Witness>,
+}
+
+/// Addresses whose signatures the envelope of `msg` must carry, in envelope order, for the types
+/// whose witness set the message fixes; `None` for the witness-array types (Call, CallMulti, Trade,
+/// Phantasma), whose witnesses the caller chooses. PhantasmaRaw fixes an empty set.
+pub fn required_witnesses(msg: &TxMsg) -> Option<Vec<Bytes32>> {
+    match msg.tx_type {
+        TxType::TransferFungible
+        | TxType::TransferNonFungibleSingle
+        | TxType::TransferNonFungibleMulti
+        | TxType::MintFungible
+        | TxType::BurnFungible
+        | TxType::MintNonFungible
+        | TxType::BurnNonFungible => Some(vec![msg.gas_from]),
+        TxType::TransferFungibleGasPayer
+        | TxType::TransferNonFungibleSingleGasPayer
+        | TxType::TransferNonFungibleMultiGasPayer
+        | TxType::BurnFungibleGasPayer
+        | TxType::BurnNonFungibleGasPayer => Some(vec![msg.gas_from, msg.msg.from_address()]),
+        TxType::PhantasmaRaw => Some(Vec::new()),
+        TxType::Call | TxType::CallMulti | TxType::Trade | TxType::Phantasma => None,
+    }
+}
+
+/// The size in bytes of `msg` once signed - the envelope the block carries and gas model v2 bills -
+/// computed without a key: signatures are fixed-width, so zero-filled placeholder witnesses
+/// serialize to exactly the signed length. The witness set is the one the message requires; for the
+/// witness-array types (Call, CallMulti, Trade, Phantasma) pass how many witnesses will sign (`None`
+/// sizes one). Every other type fixes its own count, and a stated count must agree with it - a fee
+/// kind cannot tell a two-signature gas-payer message from its one-signature form, so a wrong count
+/// here would size the envelope 64 bytes short and under-offer the transaction.
+pub fn envelope_bytes(msg: &TxMsg, witness_count: Option<u32>) -> Result<u32> {
+    let addresses = match required_witnesses(msg) {
+        Some(required) => {
+            if let Some(count) = witness_count {
+                if count as usize != required.len() {
+                    return builder(format!(
+                        "{:?} carries {} witness(es), not {count}",
+                        msg.tx_type,
+                        required.len()
+                    ));
+                }
+            }
+            required
+        }
+        None => {
+            // Placeholder set of a witness-array envelope: the gas payer, which the node requires
+            // to be a witness, then anonymous fillers. Only the count affects the size.
+            let count = witness_count.unwrap_or(1);
+            if count == 0 {
+                return builder(format!(
+                    "{:?} needs at least one witness, not 0",
+                    msg.tx_type
+                ));
+            }
+            let mut addresses = vec![EMPTY_BYTES32; count as usize];
+            addresses[0] = msg.gas_from;
+            addresses
+        }
+    };
+    let placeholders = SignedTxMsg {
+        msg: msg.clone(),
+        witnesses: addresses
+            .into_iter()
+            .map(|address| Witness {
+                address,
+                signature: EMPTY_BYTES64,
+            })
+            .collect(),
+    };
+    let encoded = serialize(&placeholders)?;
+    u32::try_from(encoded.len())
+        .map_err(|_| PhantasmaError::Builder("envelope exceeds u32 bytes".into()))
 }
 
 impl CarbonSerializable for SignedTxMsg {
@@ -3239,13 +3321,30 @@ impl CarbonSerializable for SignedTxMsg {
             | TxType::TransferNonFungibleMultiGasPayer
             | TxType::BurnFungibleGasPayer
             | TxType::BurnNonFungibleGasPayer => {
-                if self.witnesses.len() != 2 || self.witnesses[0].address != self.msg.gas_from {
+                if self.witnesses.len() != 2 {
+                    return serialization("gas-payer transaction expects 2 witnesses");
+                }
+                if self.witnesses[0].address != self.msg.gas_from {
                     return serialization("gas witness address mismatch");
+                }
+                if self.witnesses[1].address != self.msg.msg.from_address() {
+                    return serialization("from witness address mismatch");
                 }
                 writer.write64(self.witnesses[0].signature);
                 writer.write64(self.witnesses[1].signature);
             }
             TxType::Call | TxType::CallMulti | TxType::Trade | TxType::Phantasma => {
+                // The witness set of these types is the caller's to choose, with one rule the node
+                // enforces: the account paying the gas must be among the signers, or the
+                // transaction is rejected as "not signed by gas payer". Catching it here names the
+                // mistake instead of spending a round trip on it.
+                if !self
+                    .witnesses
+                    .iter()
+                    .any(|witness| witness.address == self.msg.gas_from)
+                {
+                    return serialization("the gas payer must be one of the witnesses");
+                }
                 write_carbon_array(writer, &self.witnesses)?;
             }
             TxType::PhantasmaRaw => {
