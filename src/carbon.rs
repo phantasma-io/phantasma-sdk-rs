@@ -128,6 +128,35 @@ pub const SYSTEM_ADDRESS_DATA_POOL: Bytes32 = Bytes32([
 ]);
 pub const STANDARD_META_ID: &str = "_i";
 
+/// Standard metadata keys the chain recognises in token, series and chain metadata. The fee planner
+/// reads the token keys that change a creation's bill (`_brn`, `_ip`, `_soi`, `_srt`) out of the
+/// CreateToken call; the builders write `_i` into series metadata and NFT ROMs.
+pub mod standard_meta {
+    /// The reserved Carbon metadata field for Phantasma IDs.
+    pub const ID: &str = "_i";
+
+    pub const CHAIN_ADDRESS: &str = "_a";
+    pub const CHAIN_NAME: &str = "_n";
+    pub const CHAIN_NEXUS: &str = "_x";
+    pub const CHAIN_TOKENOMICS: &str = "_t";
+
+    pub const TOKEN_STAKING_ORG_ID: &str = "_soi";
+    pub const TOKEN_STAKING_ORG_THRESHOLD: &str = "_sot";
+    pub const TOKEN_STAKING_REWARD_TOKEN: &str = "_srt";
+    pub const TOKEN_STAKING_REWARD_PERIOD: &str = "_srp";
+    pub const TOKEN_STAKING_REWARD_MUL: &str = "_srm";
+    pub const TOKEN_STAKING_REWARD_DIV: &str = "_srd";
+    pub const TOKEN_STAKING_LOCK: &str = "_sl";
+    pub const TOKEN_STAKING_BOOSTER_TOKEN: &str = "_sbt";
+    pub const TOKEN_STAKING_BOOSTER_MUL: &str = "_sbm";
+    pub const TOKEN_STAKING_BOOSTER_DIV: &str = "_sbd";
+    pub const TOKEN_STAKING_BOOSTER_LIMIT: &str = "_sbl";
+    pub const TOKEN_PHANTASMA_SCRIPT: &str = "_phs";
+    pub const TOKEN_PHANTASMA_ABI: &str = "_phb";
+    pub const TOKEN_PRE_BURN: &str = "_brn";
+    pub const TOKEN_INFLATION_PERIOD: &str = "_ip";
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SmallString(pub String);
 
@@ -753,6 +782,38 @@ pub enum TokenContractMethod {
     SetTokensConfig = 25,
     UpdateSeriesMetadata = 26,
     MintPhantasmaNonFungible = 27,
+}
+
+/// Governance module method ids the SDK recognises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum GovernanceContractMethod {
+    /// Registers a name for an address.
+    RegisterName = 1,
+    /// Replaces the chain's gas configuration.
+    SetGasConfig = 3,
+}
+
+/// Governance-module arguments for registering a name: the address the name is registered for,
+/// then the name.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RegisterNameArgs {
+    pub address: Bytes32,
+    pub name: SmallString,
+}
+
+impl CarbonSerializable for RegisterNameArgs {
+    fn write_carbon(&self, writer: &mut CarbonWriter) -> Result<()> {
+        writer.write32(self.address);
+        self.name.write_carbon(writer)
+    }
+
+    fn read_carbon(reader: &mut CarbonReader<'_>) -> Result<Self> {
+        Ok(Self {
+            address: reader.read32()?,
+            name: SmallString::read_carbon(reader)?,
+        })
+    }
 }
 
 bitflags! {
@@ -4372,6 +4433,31 @@ pub fn get_nft_address(carbon_token_id: u64, instance_id: u64) -> Bytes32 {
     address[16..24].copy_from_slice(&carbon_token_id.to_le_bytes());
     address[24..32].copy_from_slice(&instance_id.to_le_bytes());
     Bytes32(address)
+}
+
+/// Splits a Carbon NFT address into the token id and instance id it was derived from. It does not
+/// check the address form; see [`is_nft_address`].
+pub fn unpack_nft_address(address: &Bytes32) -> (u64, u64) {
+    let mut token_id = [0u8; 8];
+    token_id.copy_from_slice(&address.0[16..24]);
+    let mut instance_id = [0u8; 8];
+    instance_id.copy_from_slice(&address.0[24..32]);
+    (
+        u64::from_le_bytes(token_id),
+        u64::from_le_bytes(instance_id),
+    )
+}
+
+/// Whether a 32-byte address is an NFT-derived address - the address every minted instance owns,
+/// which assets are sent to when they are infused into that NFT. The form is syntactic, the same
+/// test the chain applies: fifteen zero bytes, a 0x01 marker, then a nonzero token id and a nonzero
+/// instance id. `plan_fees` uses it to price the recipient's owner lookup.
+pub fn is_nft_address(address: &Bytes32) -> bool {
+    if address.0[15] != 1 || address.0[..15].iter().any(|byte| *byte != 0) {
+        return false;
+    }
+    let (token_id, instance_id) = unpack_nft_address(address);
+    token_id != 0 && instance_id != 0
 }
 
 pub fn unpack_nft_instance_id(instance_id: u64) -> (u32, u32) {
