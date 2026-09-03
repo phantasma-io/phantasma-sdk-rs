@@ -11,6 +11,7 @@ use crate::carbon::{
 };
 use crate::crypto::PhantasmaKeys;
 use crate::error::{builder, PhantasmaError, Result};
+use crate::rpc::convert_decimals;
 
 /// Native operations the fee calculator models exactly, plus `Script`, the budget for everything
 /// else.
@@ -1209,4 +1210,40 @@ pub fn plan_and_sign_with_keys(
     }
     let plan = plan_fees(msg, config, &plan_options)?;
     sign_and_serialize_tx_msg_with_keys(&plan.apply(msg), keys)
+}
+
+/// Decimals of the gas token: 1 KCAL = 1e10 kcal-base.
+pub const KCAL_DECIMALS: u32 = 10;
+/// Decimals of the data token: 1 SOUL = 1e8 atoms.
+pub const SOUL_DECIMALS: u32 = 8;
+
+/// A fee plan in the units a person reads: KCAL for gas, SOUL for the storage deposit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeePlanSummary {
+    /// What the transaction will cost in gas, as a decimal amount.
+    pub gas_bill: String,
+    /// The gas offer written into the transaction; the difference to `gas_bill` is refunded.
+    pub gas_offer: String,
+    /// The storage deposit the transaction may take, as a decimal amount. It is escrowed while the
+    /// transaction settles and refunded when the rows it paid for are deleted; a wallet shows it
+    /// separately from the fee, as a refundable deposit.
+    pub storage_ceiling: String,
+}
+
+/// Renders a plan for display in KCAL and SOUL.
+pub fn summarize_fee_plan(plan: &FeePlan) -> FeePlanSummary {
+    summarize_fee_plan_with_decimals(plan, KCAL_DECIMALS, SOUL_DECIMALS)
+}
+
+/// Renders a plan for display on a chain whose gas or data token has other decimals.
+pub fn summarize_fee_plan_with_decimals(
+    plan: &FeePlan,
+    gas_decimals: u32,
+    data_decimals: u32,
+) -> FeePlanSummary {
+    FeePlanSummary {
+        gas_bill: convert_decimals(&plan.expected_gas_bill.to_string(), gas_decimals),
+        gas_offer: convert_decimals(&plan.max_gas.to_string(), gas_decimals),
+        storage_ceiling: convert_decimals(&plan.max_data.to_string(), data_decimals),
+    }
 }

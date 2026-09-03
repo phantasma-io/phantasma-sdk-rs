@@ -17,11 +17,21 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
   `IntX`, generic and typed integer arrays, dynamic VM schemas/structs, token
   metadata, token info, series info, NFT ROM/RAM helpers.
 - Carbon transactions: typed `TxMsg` payloads, `SignedTxMsg`, witnesses,
-  deterministic signing, token creation, series creation, NFT minting helpers,
-  parsed token-schema JSON shape (`TokenSchemasJson` / `TokenSchemasJSON`),
-  schema JSON-to-wire builders, market/config call args, result parsers.
+  deterministic signing with any number of witnesses through `TxSigner`, native
+  transfer/mint/burn builders and token-call builders that write only the
+  caller's `TxLimits`, token creation, series creation, Phantasma NFT minting
+  helpers, parsed token-schema JSON shape (`TokenSchemasJson` /
+  `TokenSchemasJSON`), schema JSON-to-wire builders, market/config call args,
+  result parsers.
+- Fee planning (gas model v2): `estimate_native_fee` prices every native
+  operation from its rows, result and gas sites; `plan_fees` reads the
+  operation, sizes and recipients out of the message and demands the facts it
+  cannot bound; `summarize_fee_plan` renders a plan in KCAL and SOUL. The same
+  live-pinned expectations exist in the TypeScript, C# and Go SDKs.
 - JSON-RPC: async client, injectable transport for tests, read methods for common
-  account/block/token/NFT/archive/contract/state calls, send helpers for VM
+  account/block/token/NFT/archive/contract/state calls, a fee planner per client
+  (`fees()`, one cached gas config per chain), the token-creation pre-flight,
+  `send_tx_msg` (plan, pre-flight, sign, send in one step), send helpers for VM
   script and Carbon transactions, response DTOs with serde defaults and scalar
   coercion for reference RPC response quirks. Token, series, NFT and organization
   property values decode into `VmValue`, keeping the scalar, array or struct shape
@@ -65,6 +75,14 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
   timestamps are JSON numbers mapped to `u64`/`u32`/`i64`.
 - Examples avoid funded or broadcasting workflows unless the caller explicitly
   chooses to run a send method.
+- Fee planning keeps the other SDKs' names in Rust case (`plan_fees`,
+  `FeePlanOptions`, `send_tx_msg` for the one-step send, since `send_transaction`
+  is the legacy VM-transaction sender). Chain-state facts a message does not
+  carry are `Option<bool>` where the costlier reading is `true`
+  (`big_fungible`, `duplicated_series`, `rom_has_meta_id`, `series_has_meta_id`)
+  and plain bools where `false` is costlier; unstated counts are `Option`. The
+  native builders take parameter structs with an `Option<Bytes32>` gas payer
+  instead of a zero-address sentinel.
 
 ## Test Sources
 
@@ -82,10 +100,18 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
   Phantasma NFT helper paths.
 - `tests/rpc.rs` covers JSON-RPC request/response behavior through a mock
   transport.
+- `tests/carbon_envelopes.rs` and `tests/carbon_signing.rs` cover the witness
+  layouts, envelope sizes and multi-witness signing.
+- `tests/native_fee_estimator.rs`, `tests/fee_plan.rs`, `tests/native_builders.rs`
+  and `tests/fee_plan_summary.rs` cover the fee model: every v2 expectation is a
+  bill a transaction was charged on a gas-model-v2 network.
+- `tests/fee_planner.rs`, `tests/send_tx_msg.rs` and `tests/rpc_error.rs` cover
+  the client-side planner, the pre-flight and the one-step send against a canned
+  node.
 - `tests/extended_events.rs` covers typed extended-event decoding: kind
   dispatch, the full 43-pair argument dispatch table, raw fallbacks, and wire
   round-trips, with fixtures captured from devnet on 2026-08-01.
 
 Live localnet execution and funded/broadcasting examples are intentionally not
-part of the default test suite. The read-only RPC example can be run against an
-existing endpoint; offline examples never broadcast.
+part of the default test suite. The read-only RPC and fee-planning examples can
+be run against an existing endpoint; offline examples never broadcast.
