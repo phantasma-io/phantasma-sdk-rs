@@ -9,6 +9,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use base64::Engine;
 use bitflags::bitflags;
 use num_bigint::BigInt;
@@ -16,7 +17,7 @@ use num_traits::{ToPrimitive, Zero};
 use serde_json::Value;
 
 use crate::binary::{ensure_u32_len, signed_word_256, signed_word_to_big_int};
-use crate::crypto::{Address, AddressKind, PhantasmaKeys};
+use crate::crypto::{Address, AddressKind, PhantasmaKeys, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use crate::encoding::decode_hex;
 use crate::error::{builder, crypto, serialization, PhantasmaError, Result};
 
@@ -4561,15 +4562,32 @@ pub fn build_mint_phantasma_non_fungible_single_tx_and_sign_hex(
     ))
 }
 
+/// Produces one witness of a Carbon transaction: keys held in memory, a hardware wallet, a remote
+/// signing service. Every signer signs the same serialized message, and the SDK pairs each one
+/// with the envelope slot its public key owns. [`PhantasmaKeys`] implements it for in-memory keys.
+#[async_trait]
+pub trait TxSigner: Send + Sync {
+    /// The 32-byte Ed25519 public key that becomes the witness address.
+    fn public_key(&self) -> [u8; PUBLIC_KEY_LENGTH];
+    /// The raw 64-byte Ed25519 signature of the serialized message.
+    async fn sign_message(&self, message: &[u8]) -> Result<[u8; SIGNATURE_LENGTH]>;
+}
+
+#[async_trait]
+impl TxSigner for PhantasmaKeys {
+    fn public_key(&self) -> [u8; PUBLIC_KEY_LENGTH] {
+        PhantasmaKeys::public_key(self)
+    }
+
+    async fn sign_message(&self, message: &[u8]) -> Result<[u8; SIGNATURE_LENGTH]> {
+        Ok(*self.sign(message).data())
+    }
+}
+
+/// Signs a single-witness message with in-memory keys. See [`sign_tx_msg_with_keys`] for every
+/// transaction type.
 pub fn sign_tx_msg(msg: &TxMsg, keys: &PhantasmaKeys) -> Result<SignedTxMsg> {
-    let signature = keys.sign(serialize(msg)?);
-    Ok(SignedTxMsg {
-        msg: msg.clone(),
-        witnesses: vec![Witness {
-            address: bytes32_from_public_key(&keys.public_key())?,
-            signature: Bytes64(*signature.data()),
-        }],
-    })
+    sign_tx_msg_with_keys(msg, &[keys])
 }
 
 pub fn sign_and_serialize_tx_msg(msg: &TxMsg, keys: &PhantasmaKeys) -> Result<Vec<u8>> {
@@ -4578,6 +4596,136 @@ pub fn sign_and_serialize_tx_msg(msg: &TxMsg, keys: &PhantasmaKeys) -> Result<Ve
 
 pub fn sign_and_serialize_tx_msg_hex(msg: &TxMsg, keys: &PhantasmaKeys) -> Result<String> {
     Ok(hex::encode(sign_and_serialize_tx_msg(msg, keys)?))
+}
+
+/// Signs a message with in-memory keys, one per witness the message needs. Works for every
+/// transaction type: a gas-payer transfer takes the gas payer's and the owner's keys in any order,
+/// a Call takes the keys of every witness the contract will check, in the order they are to appear.
+pub fn sign_tx_msg_with_keys(msg: &TxMsg, keys: &[&PhantasmaKeys]) -> Result<SignedTxMsg> {
+    assert_planned(msg)?;
+    let addresses = keys
+        .iter()
+        .map(|key| bytes32_from_public_key(&key.public_key()))
+        .collect::<Result<Vec<_>>>()?;
+    let slots = witness_slots(msg, &addresses)?;
+    let message = serialize(msg)?;
+    let signatures: Vec<Bytes64> = keys
+        .iter()
+        .map(|key| Bytes64(*key.sign(&message).data()))
+        .collect();
+    Ok(SignedTxMsg {
+        msg: msg.clone(),
+        witnesses: slots
+            .into_iter()
+            .map(|(address, signer)| Witness {
+                address,
+                signature: signatures[signer],
+            })
+            .collect(),
+    })
+}
+
+pub fn sign_and_serialize_tx_msg_with_keys(
+    msg: &TxMsg,
+    keys: &[&PhantasmaKeys],
+) -> Result<Vec<u8>> {
+    serialize(&sign_tx_msg_with_keys(msg, keys)?)
+}
+
+/// Signs a message with any [`TxSigner`]s - keys, hardware wallets, remote services - one per
+/// witness. Every signer signs the same serialized message; a signer that must witness twice (the
+/// same account paying the gas and owning the tokens) is asked once and its signature reused.
+pub async fn sign_tx_msg_with(msg: &TxMsg, signers: &[&dyn TxSigner]) -> Result<SignedTxMsg> {
+    assert_planned(msg)?;
+    let addresses = signers
+        .iter()
+        .map(|signer| bytes32_from_public_key(&signer.public_key()))
+        .collect::<Result<Vec<_>>>()?;
+    let slots = witness_slots(msg, &addresses)?;
+    let message = serialize(msg)?;
+    let mut signatures: Vec<Option<Bytes64>> = vec![None; signers.len()];
+    let mut witnesses = Vec::with_capacity(slots.len());
+    for (address, signer) in slots {
+        if signatures[signer].is_none() {
+            signatures[signer] = Some(Bytes64(signers[signer].sign_message(&message).await?));
+        }
+        witnesses.push(Witness {
+            address,
+            signature: signatures[signer].expect("signed above"),
+        });
+    }
+    Ok(SignedTxMsg {
+        msg: msg.clone(),
+        witnesses,
+    })
+}
+
+pub async fn sign_and_serialize_tx_msg_with(
+    msg: &TxMsg,
+    signers: &[&dyn TxSigner],
+) -> Result<Vec<u8>> {
+    serialize(&sign_tx_msg_with(msg, signers).await?)
+}
+
+// A zero gas offer is never admissible, so it marks a message that was built but not planned;
+// signing it would only produce a rejection. Plan with `PhantasmaRpc::fees` / `plan_fees`, or set
+// `max_gas` deliberately.
+fn assert_planned(msg: &TxMsg) -> Result<()> {
+    if msg.max_gas == 0 {
+        return builder(
+            "transaction has no gas offer: plan its fees or set max_gas before signing",
+        );
+    }
+    Ok(())
+}
+
+// Pairs every witness slot of the envelope with the signer (by index) that owns its address. For
+// the types whose witness set the node fixes (native transfers, mints, burns and their gas-payer
+// variants) the slots come in envelope order regardless of how the signers were passed, and the
+// signer set must match the required addresses exactly - a missing owner key or a stray extra key
+// is a caller mistake the node would reject later at a cost. For the witness-array types the
+// caller's order is the envelope order, and the gas payer must be among them.
+fn witness_slots(msg: &TxMsg, addresses: &[Bytes32]) -> Result<Vec<(Bytes32, usize)>> {
+    let Some(required) = required_witnesses(msg) else {
+        if addresses.is_empty() {
+            return builder(format!(
+                "{:?} transactions need at least one witness",
+                msg.tx_type
+            ));
+        }
+        if !addresses.contains(&msg.gas_from) {
+            return builder(format!(
+                "the gas payer {} must be one of the witnesses",
+                msg.gas_from
+            ));
+        }
+        return Ok(addresses
+            .iter()
+            .enumerate()
+            .map(|(index, address)| (*address, index))
+            .collect());
+    };
+    if required.is_empty() {
+        if !addresses.is_empty() {
+            return builder(format!("{:?} transactions carry no witnesses", msg.tx_type));
+        }
+        return Ok(Vec::new());
+    }
+    let mut slots = Vec::with_capacity(required.len());
+    for address in &required {
+        let Some(index) = addresses.iter().position(|candidate| candidate == address) else {
+            return builder(format!("no signer for witness {address}"));
+        };
+        slots.push((*address, index));
+    }
+    for address in addresses {
+        if !required.contains(address) {
+            return builder(format!(
+                "signer {address} is not a witness of this transaction"
+            ));
+        }
+    }
+    Ok(slots)
 }
 
 pub fn get_nft_address(carbon_token_id: u64, instance_id: u64) -> Bytes32 {
