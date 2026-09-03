@@ -4,12 +4,13 @@
 //! higher-level wrappers inherit the same id checks, error extraction, scalar
 //! coercions, and transaction-hash handling.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -19,14 +20,18 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 
 use crate::carbon::{
-    parse_create_token_result, parse_create_token_series_result, serialize, sign_tx_msg, Bytes32,
-    GasConfig, SignedTxMsg, TxMsg,
+    deserialize, get_nft_address, parse_create_token_result, parse_create_token_series_result,
+    required_witnesses, serialize, sign_and_serialize_tx_msg_with, sign_tx_msg, Bytes32, GasConfig,
+    ModuleId, SignedTxMsg, TokenContractMethod, TokenInfo, TxMsg, TxPayload, TxSigner, TxType,
 };
 use crate::crypto::PhantasmaKeys;
 use crate::encoding::{decode_hex, encode_hex};
 use crate::error::{rpc, PhantasmaError, Result};
 use crate::extended_events::EventData;
-use crate::fees::FeeQuote;
+use crate::fees::{
+    plan_fees, FeePlan, FeePlanOptions, FeeQuote, InfusedAsset,
+    GAS_MODEL_V2_UNITS_PER_BLOCK_DATA_BYTE,
+};
 use crate::transaction::{tx_state_is_fault, tx_state_is_success, Transaction};
 use crate::vm::VMObject;
 
@@ -131,12 +136,187 @@ async fn read_limited_response_text(
     Ok((status, text))
 }
 
+/// The address-type parameter value that reads account text as a Carbon address (32 bytes, hex).
+pub const ADDRESS_TYPE_CARBON: &str = "Carbon";
+
+/// How long a fetched gas config is reused before it is read again. Prices change only by
+/// governance resolution, but a stale price under-offers every transaction until it is noticed,
+/// so the default is short.
+pub const DEFAULT_FEE_CONFIG_TTL: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct PhantasmaRpc<T = ReqwestTransport> {
     endpoint: String,
     timeout: Duration,
     transport: T,
     next_request_id: Arc<AtomicU64>,
+    // The fee planner's cache: one per client, shared by its clones, so a process talking to
+    // several chains has one per chain and no shared prices.
+    fee_cache: Arc<Mutex<Option<CachedGasConfig>>>,
+    fee_config_ttl: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct CachedGasConfig {
+    config: GasConfig,
+    params: ChainFeeParams,
+    fetched_at: Instant,
+}
+
+/// Chain parameters the fee flow needs that are not part of the on-chain [`GasConfig`]: they
+/// describe the node's admission rules rather than its prices, and arrive in the same getGasConfig
+/// answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainFeeParams {
+    /// The longest lifetime the chain admits for a transaction - it refuses an expiry at or beyond
+    /// now + `expiry_window`. Feed it to [`crate::expiry_within`] when a person sits between
+    /// building a transaction and signing it.
+    pub expiry_window: Duration,
+    /// The target time between blocks.
+    pub block_rate_target: Duration,
+    /// The gas model the node runs: 1 = the original fee model, 2 = gas model v2.
+    pub gas_model_version: u32,
+}
+
+/// The options of [`FeePlanner::plan`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanRequestOptions {
+    /// The facts the plan cannot read from the message; see [`FeePlanOptions`].
+    pub facts: FeePlanOptions,
+    /// Reads the gas config again before planning, ignoring the cache.
+    pub refresh_config: bool,
+}
+
+/// The options of [`PhantasmaRpc::send_tx_msg`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SendTransactionOptions {
+    /// How to plan a message whose gas offer is still zero.
+    pub plan: PlanRequestOptions,
+    /// Sends a token creation without asking the chain whether its symbol is taken. By default the
+    /// creation is refused unless the chain answered that the symbol is free (see
+    /// [`PhantasmaRpc::preflight_transaction`]); every other message is unaffected either way.
+    ///
+    /// The pre-flight refuses a lookup that did not answer, not only one that answered "taken":
+    /// the policy fee is spent before the contract looks at the symbol, so sending on an
+    /// unestablished state is exactly the outcome worth paying a round trip to avoid.
+    pub skip_preflight: bool,
+}
+
+/// What a pre-flight established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreflightVerdict {
+    /// The message is not a token creation, so there is nothing to check.
+    NotApplicable,
+    /// The chain answered that the symbol is in use.
+    Taken,
+    /// The chain answered, through the control, that it is not.
+    Free,
+    /// The lookup did not answer. Nothing follows from it; in particular it is not free.
+    Unknown,
+}
+
+/// The outcome of [`PhantasmaRpc::preflight_transaction`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightResult {
+    pub verdict: PreflightVerdict,
+    /// What was being checked, e.g. "token symbol GPX". Empty when nothing was.
+    pub subject: String,
+    /// Why the lookup established nothing, in the node's own words. Only on `Unknown`.
+    pub reason: String,
+}
+
+/// Plans transaction fees against one chain: reads that chain's gas config through its client,
+/// keeps it for a short while, and prices messages with it. Every [`PhantasmaRpc`] owns one as
+/// [`PhantasmaRpc::fees`]; the cache lives in the client, so its clones share it and two clients of
+/// two chains never do.
+#[derive(Debug, Clone, Copy)]
+pub struct FeePlanner<'a, T> {
+    client: &'a PhantasmaRpc<T>,
+}
+
+impl<T: RpcTransport> FeePlanner<'_, T> {
+    /// The chain's gas config, read from the node when the cached one is missing or expired, or
+    /// when `refresh` is set.
+    pub async fn config(&self, refresh: bool) -> Result<GasConfig> {
+        Ok(self.read(refresh).await?.config)
+    }
+
+    /// The chain's admission parameters, from the same answer and the same cache as
+    /// [`Self::config`].
+    pub async fn chain_params(&self, refresh: bool) -> Result<ChainFeeParams> {
+        Ok(self.read(refresh).await?.params)
+    }
+
+    /// Forgets the cached config; the next plan reads it again.
+    pub fn invalidate(&self) {
+        *self.client.fee_cache_slot() = None;
+    }
+
+    /// Plans a message against the chain's current prices. See [`plan_fees`].
+    pub async fn plan(&self, msg: &TxMsg, options: &PlanRequestOptions) -> Result<FeePlan> {
+        let config = self.config(options.refresh_config).await?;
+        let facts = self.with_infusions(msg, &options.facts).await?;
+        plan_fees(msg, &config, &facts)
+    }
+
+    /// Plans a message against a config the caller already holds - no network, no cache.
+    pub fn plan_with(
+        &self,
+        config: &GasConfig,
+        msg: &TxMsg,
+        options: &FeePlanOptions,
+    ) -> Result<FeePlan> {
+        plan_fees(msg, config, options)
+    }
+
+    // Fills in what a burned NFT holds. A burn returns whatever the NFT's own address holds, and the
+    // chain charges for each returned asset. That set is chain state the message does not carry
+    // and has no costlier bound, so the pure planner demands it; here, with a chain to ask, it is
+    // read unless the caller stated it (an empty list states that the NFT holds nothing).
+    async fn with_infusions(&self, msg: &TxMsg, facts: &FeePlanOptions) -> Result<FeePlanOptions> {
+        if facts.infusions.is_some() {
+            return Ok(facts.clone());
+        }
+        let (token_id, instance_id) = match &msg.msg {
+            TxPayload::BurnNonFungible(burn) => (burn.token_id, burn.instance_id),
+            TxPayload::BurnNonFungibleGasPayer(burn) => (burn.token_id, burn.instance_id),
+            _ => return Ok(facts.clone()),
+        };
+        let infusions = self
+            .client
+            .infused_assets(token_id, instance_id)
+            .await
+            .map_err(|err| PhantasmaError::Rpc {
+                code: None,
+                message: format!("reading what the burned NFT holds: {err}"),
+            })?;
+        Ok(FeePlanOptions {
+            infusions: Some(infusions),
+            ..facts.clone()
+        })
+    }
+
+    async fn read(&self, refresh: bool) -> Result<CachedGasConfig> {
+        if !refresh {
+            if let Some(cached) = self.client.fee_cache_slot().as_ref() {
+                if cached.fetched_at.elapsed() < self.client.fee_config_ttl {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+        let result = self.client.get_gas_config().await?;
+        let entry = CachedGasConfig {
+            config: result.to_gas_config()?,
+            params: ChainFeeParams {
+                expiry_window: Duration::from_millis(u64::from(result.expiry_window)),
+                block_rate_target: Duration::from_millis(u64::from(result.block_rate_target)),
+                gas_model_version: result.gas_model_version,
+            },
+            fetched_at: Instant::now(),
+        };
+        *self.client.fee_cache_slot() = Some(entry.clone());
+        Ok(entry)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,12 +359,7 @@ impl<T> RpcCallResult<T> {
 
 impl PhantasmaRpc<ReqwestTransport> {
     pub fn new(endpoint: impl Into<String>) -> Self {
-        Self {
-            endpoint: endpoint.into(),
-            timeout: Duration::from_secs(30),
-            transport: ReqwestTransport::default(),
-            next_request_id: Arc::new(AtomicU64::new(INITIAL_JSON_RPC_REQUEST_ID)),
-        }
+        Self::with_transport(endpoint, ReqwestTransport::default())
     }
 
     pub fn mainnet() -> Self {
@@ -214,12 +389,34 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
             timeout: Duration::from_secs(30),
             transport,
             next_request_id: Arc::new(AtomicU64::new(INITIAL_JSON_RPC_REQUEST_ID)),
+            fee_cache: Arc::new(Mutex::new(None)),
+            fee_config_ttl: DEFAULT_FEE_CONFIG_TTL,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// How long the fee planner reuses a fetched gas config; see [`DEFAULT_FEE_CONFIG_TTL`].
+    pub fn with_fee_config_ttl(mut self, ttl: Duration) -> Self {
+        self.fee_config_ttl = ttl;
+        self
+    }
+
+    /// The fee planner of the chain this client talks to: it reads the chain's gas config through
+    /// this client, caches it briefly, and prices messages with it
+    /// (`client.fees().plan(&msg, &options).await`).
+    pub fn fees(&self) -> FeePlanner<'_, T> {
+        FeePlanner { client: self }
+    }
+
+    fn fee_cache_slot(&self) -> std::sync::MutexGuard<'_, Option<CachedGasConfig>> {
+        // A panic while holding the lock leaves a cache, not an invariant, behind: reuse it.
+        self.fee_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn next_json_rpc_request_id(&self) -> u64 {
@@ -1347,6 +1544,221 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
         Ok((tx_hash, None))
     }
 
+    /// The gas token's id, which the pre-flight uses as its control lookup: it certainly exists
+    /// on any live chain. It comes from the same cached gas config the planner reads, so asking
+    /// costs a round trip only once a minute. An error means this client cannot read that config;
+    /// the pre-flight then reports unknown rather than guessing.
+    pub async fn control_token_id(&self) -> Result<u64> {
+        Ok(self.fees().config(false).await?.gas_token_id)
+    }
+
+    /// What NFT `instance_id` of token `token_id` holds at its own address, in the form the fee
+    /// planner prices: a burn of that NFT returns every one of these to the burner and pays for
+    /// each. Read through the account queries with the address in its Carbon form; fungible
+    /// balances are resolved to token ids so the free rows of the gas and data tokens are
+    /// recognised. Whether the burner already holds a returned token is left at the costlier
+    /// reading, which moves only the escrow ceiling.
+    pub async fn infused_assets(
+        &self,
+        token_id: u64,
+        instance_id: u64,
+    ) -> Result<Vec<InfusedAsset>> {
+        let address = get_nft_address(token_id, instance_id).to_string();
+        let address = address.as_str();
+        let mut assets = Vec::new();
+        let balances = read_all_pages(|cursor| async move {
+            self.get_account_fungible_tokens_with_address_type(
+                address,
+                "",
+                0,
+                100,
+                &cursor,
+                false,
+                ADDRESS_TYPE_CARBON,
+            )
+            .await
+        })
+        .await?;
+        for balance in balances {
+            let token = self
+                .get_token(&balance.symbol, false)
+                .await
+                .map_err(|err| PhantasmaError::Rpc {
+                    code: None,
+                    message: format!("resolving infused token {}: {err}", balance.symbol),
+                })?;
+            assets.push(InfusedAsset {
+                token_id: Some(parse_carbon_id(&token.carbon_id, &balance.symbol)?),
+                ..InfusedAsset::default()
+            });
+        }
+        let owned = read_all_pages(|cursor| async move {
+            self.get_account_owned_tokens_with_address_type(
+                address,
+                "",
+                0,
+                100,
+                &cursor,
+                false,
+                ADDRESS_TYPE_CARBON,
+            )
+            .await
+        })
+        .await?;
+        for token in owned {
+            let balance = self
+                .get_token_balance_with_address_type(
+                    address,
+                    &token.symbol,
+                    "main",
+                    false,
+                    ADDRESS_TYPE_CARBON,
+                )
+                .await
+                .map_err(|err| PhantasmaError::Rpc {
+                    code: None,
+                    message: format!("reading infused {} instances: {err}", token.symbol),
+                })?;
+            let instances = balance
+                .amount
+                .parse::<u32>()
+                .map_err(|err| PhantasmaError::Rpc {
+                    code: None,
+                    message: format!(
+                        "infused {} instance count {:?}: {err}",
+                        token.symbol, balance.amount
+                    ),
+                })?;
+            assets.push(InfusedAsset {
+                token_id: Some(parse_carbon_id(&token.carbon_id, &token.symbol)?),
+                non_fungible: true,
+                instance_count: Some(instances),
+                burner_holds_token: false,
+            });
+        }
+        Ok(assets)
+    }
+
+    /// Asks the chain whether the symbol a CreateToken claims is already in use. The call consumes
+    /// its policy fee - the largest single price in the protocol, set by governance and readable
+    /// from getGasConfig - before the contract looks at the symbol, so sending one that is taken
+    /// pays that fee for nothing. One lookup answers it.
+    ///
+    /// A symbol that resolves to a token is [`PreflightVerdict::Taken`]. A symbol that does not is
+    /// reported by the node as an ordinary RPC error, the same way it reports a missing method or
+    /// a failed backend, and nothing in the answer separates those: every one of them arrives as
+    /// the same internal error code with prose for a message. So an error alone is never read as
+    /// absence. Instead the check asks a second question it already knows the answer to - fetch
+    /// the CONTROL token by its id, which the node resolves without touching the symbol at all. A
+    /// node that answers that is a node that is answering, so its refusal about the caller's
+    /// symbol is a real absence and the verdict is [`PreflightVerdict::Free`]; a node that does
+    /// not answer it has established nothing and the verdict is [`PreflightVerdict::Unknown`].
+    /// Without a control every absent symbol is unknown.
+    ///
+    /// The control proves the node is serving token lookups. It does not exercise symbol
+    /// resolution itself, so a node whose token rows read while its symbol index does not would
+    /// still be believed. That is the residual, and it is a far narrower one than trusting an
+    /// error message.
+    ///
+    /// The verdict is reported rather than acted on; [`Self::send_tx_msg`] refuses on taken and on
+    /// unknown. The message's own validity - flags, metadata, schemas - is enforced by the
+    /// builders; this is the part only the chain can answer.
+    pub async fn preflight_transaction(&self, msg: &TxMsg) -> Result<PreflightResult> {
+        let not_applicable = PreflightResult {
+            verdict: PreflightVerdict::NotApplicable,
+            subject: String::new(),
+            reason: String::new(),
+        };
+        let TxPayload::Call(call) = &msg.msg else {
+            return Ok(not_applicable);
+        };
+        if msg.tx_type != TxType::Call
+            || call.module_id != ModuleId::Token as u32
+            || call.method_id != TokenContractMethod::CreateToken as u32
+        {
+            return Ok(not_applicable);
+        }
+        let info: TokenInfo = deserialize(&call.args).map_err(|err| {
+            PhantasmaError::Builder(format!("preflight: CreateToken arguments: {err}"))
+        })?;
+        let symbol = info.symbol.0;
+        if symbol.is_empty() {
+            return Ok(not_applicable);
+        }
+        let subject = format!("token symbol {symbol}");
+        let verdict = |verdict, reason: String| PreflightResult {
+            verdict,
+            subject: subject.clone(),
+            reason,
+        };
+
+        // A token came back, so the symbol resolves to one. Nothing else is read from it: the
+        // question was only whether it exists.
+        let Err(err) = self.get_token_with_id(&symbol, false, 0).await else {
+            return Ok(verdict(PreflightVerdict::Taken, String::new()));
+        };
+        let control = match self.control_token_id().await {
+            Ok(control) if control != 0 => control,
+            _ => return Ok(verdict(PreflightVerdict::Unknown, lookup_reason(&err))),
+        };
+        Ok(match self.get_token_with_id("", false, control).await {
+            Ok(_) => verdict(PreflightVerdict::Free, String::new()),
+            Err(probe) => verdict(PreflightVerdict::Unknown, lookup_reason(&probe)),
+        })
+    }
+
+    /// Sends a message in one step: pre-flight, fee plan, signatures, broadcast. A message whose
+    /// `max_gas` is still zero is planned against this chain's prices ([`Self::fees`]); one the
+    /// caller already planned is sent as it is. Every witness signs through its [`TxSigner`] -
+    /// keys, hardware, or a remote service. Returns the transaction hash.
+    ///
+    /// The pre-flight refuses a token creation whose symbol the chain says is taken, and one it
+    /// could not establish anything about; see [`SendTransactionOptions::skip_preflight`].
+    pub async fn send_tx_msg(
+        &self,
+        msg: &TxMsg,
+        signers: &[&dyn TxSigner],
+        options: &SendTransactionOptions,
+    ) -> Result<String> {
+        if !options.skip_preflight {
+            let check = self.preflight_transaction(msg).await?;
+            match check.verdict {
+                PreflightVerdict::Taken => {
+                    return Err(PhantasmaError::Preflight(format!(
+                        "{} is already taken",
+                        check.subject
+                    )))
+                }
+                PreflightVerdict::Unknown => {
+                    return Err(PhantasmaError::Preflight(format!(
+                        "could not establish whether {} is taken: {}",
+                        check.subject, check.reason
+                    )))
+                }
+                PreflightVerdict::NotApplicable | PreflightVerdict::Free => {}
+            }
+        }
+        let planned;
+        let msg = if msg.max_gas == 0 {
+            // Only the witness-array types take their witness count from the caller; for every
+            // other type the message itself fixes the slots, and one signer may legitimately fill
+            // two of them.
+            let mut plan_options = options.plan.clone();
+            if required_witnesses(msg).is_none() && plan_options.facts.witness_count.is_none() {
+                plan_options.facts.witness_count =
+                    Some(u32::try_from(signers.len()).map_err(|_| {
+                        PhantasmaError::Builder("send_tx_msg: too many signers".into())
+                    })?);
+            }
+            planned = self.fees().plan(msg, &plan_options).await?.apply(msg);
+            &planned
+        } else {
+            msg
+        };
+        let envelope = sign_and_serialize_tx_msg_with(msg, signers).await?;
+        self.send_carbon_transaction(&envelope).await
+    }
+
     pub async fn get_phantasma_vm_config(&self, chain: &str) -> Result<PhantasmaVmConfigResult> {
         self.call("getPhantasmaVmConfig", vec![json!(chain)]).await
     }
@@ -1416,6 +1828,61 @@ pub fn parse_json_rpc_response_for_request(
             code: None,
             message: "missing result".into(),
         })
+}
+
+// The node's own words when it answered with a JSON-RPC error, or the transport failure otherwise.
+// Neither is inspected further: nothing in either distinguishes "there is no such symbol" from
+// "this node could not tell you".
+fn lookup_reason(err: &PhantasmaError) -> String {
+    match err {
+        PhantasmaError::Rpc { message, .. } if !message.is_empty() => message.clone(),
+        other => {
+            let text = other.to_string();
+            if text.is_empty() {
+                "the lookup failed".into()
+            } else {
+                text
+            }
+        }
+    }
+}
+
+fn parse_carbon_id(value: &str, symbol: &str) -> Result<u64> {
+    value.parse::<u64>().map_err(|_| PhantasmaError::Rpc {
+        code: None,
+        message: format!("token {symbol} has no Carbon id: {value:?}"),
+    })
+}
+
+// Walks a cursor-paginated query to the end. The loop is driven by the cursor the node returns,
+// never by an item count, and stops on a cursor it has already seen or past a page cap so a
+// misbehaving node cannot keep it going forever.
+async fn read_all_pages<Item, Page, Fut>(page: Page) -> Result<Vec<Item>>
+where
+    Page: Fn(String) -> Fut,
+    Fut: Future<Output = Result<CursorPaginatedResult<Vec<Item>>>>,
+{
+    const MAX_PAGES: usize = 1000;
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = String::new();
+    for _ in 0..MAX_PAGES {
+        let result = page(cursor.clone()).await?;
+        items.extend(result.result.unwrap_or_default());
+        match result.cursor {
+            Some(next) if !next.is_empty() => {
+                if !seen.insert(next.clone()) {
+                    return Ok(items);
+                }
+                cursor = next;
+            }
+            _ => return Ok(items),
+        }
+    }
+    rpc(
+        None,
+        format!("the node kept returning pages past {MAX_PAGES}"),
+    )
 }
 
 fn json_rpc_id_matches(id: &Value, expected: u64) -> bool {
@@ -2036,6 +2503,20 @@ impl GasConfigResult {
                 parse_u64_field(&data.policy_fee_register_name, "policyFeeRegisterName")?;
             config.legacy_data_escrow_per_row =
                 parse_u64_field(&data.legacy_data_escrow_per_row, "legacyDataEscrowPerRow")?;
+        }
+        // The calculator prices block data at the fixed v2 rate. A node that reports another rate
+        // would be under- or over-billed on the largest term of every bill, so the conversion
+        // refuses instead of pricing wrong; a node that does not report it (an older build) is
+        // taken at the rate the model was built for.
+        if let Some(units) = self.units_per_block_data_byte {
+            if u64::from(units) != GAS_MODEL_V2_UNITS_PER_BLOCK_DATA_BYTE {
+                return rpc(
+                    None,
+                    format!(
+                        "this node prices block data at {units} gas units per byte, this SDK implements {GAS_MODEL_V2_UNITS_PER_BLOCK_DATA_BYTE}: upgrade the SDK"
+                    ),
+                );
+            }
         }
         Ok(config)
     }

@@ -25,6 +25,10 @@ pub enum PhantasmaError {
     Http(String),
     #[error("json error: {0}")]
     Json(String),
+    /// A transaction the chain would reject after charging for it, caught before signing; see
+    /// `PhantasmaRpc::preflight_transaction`.
+    #[error("pre-flight refused the transaction: {0}")]
+    Preflight(String),
 }
 
 impl From<hex::FromHexError> for PhantasmaError {

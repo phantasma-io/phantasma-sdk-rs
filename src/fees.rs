@@ -793,7 +793,7 @@ pub struct FeePlanOptions {
     /// those types and for them only: their witness set is chosen by the caller, nothing in the
     /// message says how large it will be, and each witness adds 96 bytes the chain bills. Every
     /// other type fixes its own witness set, so a count stated for one of them must agree with it.
-    /// `PhantasmaRpc::send_transaction` fills it in from the signers it was given.
+    /// `PhantasmaRpc::send_tx_msg` fills it in from the signers it was given.
     pub witness_count: Option<u32>,
     /// See [`NativeFeeParams::recipient_holds_token`].
     pub recipient_holds_token: bool,
@@ -1191,7 +1191,7 @@ pub fn plan_and_sign_with_keys(
 ) -> Result<Vec<u8>> {
     // Whether the fee is already settled is read from the MESSAGE: the builders are what write the
     // caller's limits into it, so the message is the one place that is right for every helper. The
-    // same rule as PhantasmaRpc::send_transaction.
+    // same rule as PhantasmaRpc::send_tx_msg.
     if msg.max_gas != 0 {
         return sign_and_serialize_tx_msg_with_keys(msg, keys);
     }

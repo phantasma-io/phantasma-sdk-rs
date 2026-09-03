@@ -180,3 +180,18 @@ fn missing_gas_config_section_fails() {
     };
     assert!(result.to_gas_config().is_err());
 }
+
+// The calculator prices block data at the fixed v2 rate. A node that reports another rate would be
+// mis-billed on the largest term of every bill, so the conversion refuses; a node that does not
+// report the rate (an older build) converts as before.
+#[test]
+fn refuses_a_byte_price_the_sdk_does_not_implement() {
+    let mut broken = v2_result();
+    broken.units_per_block_data_byte = Some(26);
+    let err = broken.to_gas_config().unwrap_err();
+    assert!(err.to_string().contains("upgrade the SDK"), "{err}");
+
+    let mut older = v2_result();
+    older.units_per_block_data_byte = None;
+    assert!(older.to_gas_config().is_ok());
+}
