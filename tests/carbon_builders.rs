@@ -186,7 +186,9 @@ fn token_info_flags_and_schema_serialization_are_stable() {
         ("description", "Demo"),
     ])
     .unwrap();
-    let fungible = build_token_info(
+    // An unlimited supply (zero) has no int64 bound, so the chain requires the big-fungible flag
+    // and refuses an "unlimited small fungible"; a bounded supply that fits int64 is small.
+    let unlimited = build_token_info(
         "FUNGIBLE",
         IntX::from(0i64),
         false,
@@ -196,7 +198,29 @@ fn token_info_flags_and_schema_serialization_are_stable() {
         vec![],
     )
     .unwrap();
-    assert_eq!(fungible.flags, TokenFlags::NONE);
+    assert_eq!(unlimited.flags, TokenFlags::BIG_FUNGIBLE);
+    let limited = build_token_info(
+        "FUNGIBLE",
+        IntX::from(100_000i64),
+        false,
+        8,
+        Bytes32::default(),
+        metadata.clone(),
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(limited.flags, TokenFlags::NONE);
+    let huge = build_token_info(
+        "FUNGIBLE",
+        IntX(BigInt::from(1u8) << 70),
+        false,
+        8,
+        Bytes32::default(),
+        metadata.clone(),
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(huge.flags, TokenFlags::BIG_FUNGIBLE);
     let nft = build_token_info(
         "NFT",
         IntX::from(100i64),

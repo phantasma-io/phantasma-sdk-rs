@@ -3312,13 +3312,15 @@ pub fn required_witnesses(msg: &TxMsg) -> Option<Vec<Bytes32>> {
     }
 }
 
-/// The size in bytes of `msg` once signed - the envelope the block carries and gas model v2 bills -
-/// computed without a key: signatures are fixed-width, so zero-filled placeholder witnesses
-/// serialize to exactly the signed length. The witness set is the one the message requires; for the
-/// witness-array types (Call, CallMulti, Trade, Phantasma) pass how many witnesses will sign (`None`
-/// sizes one). Every other type fixes its own count, and a stated count must agree with it - a fee
-/// kind cannot tell a two-signature gas-payer message from its one-signature form, so a wrong count
-/// here would size the envelope 64 bytes short and under-offer the transaction.
+/// The size in bytes of `msg` once signed. That is the envelope the block carries and gas model v2
+/// bills. No key is needed: signatures are fixed-width, so zero-filled placeholder witnesses
+/// serialize to exactly the signed length.
+///
+/// The witness set is the one the message requires. For the witness-array types (Call, CallMulti,
+/// Trade, Phantasma) pass how many witnesses will sign; `None` sizes one. Every other type fixes its
+/// own count, and a stated count must agree with it. A fee kind cannot tell a two-signature
+/// gas-payer message from its one-signature form, so a wrong count here would size the envelope 64
+/// bytes short and under-offer the transaction.
 pub fn envelope_bytes(msg: &TxMsg, witness_count: Option<u32>) -> Result<u32> {
     let addresses = match required_witnesses(msg) {
         Some(required) => {
@@ -3456,8 +3458,8 @@ impl CarbonSerializable for SignedTxMsg {
 }
 
 /// The explicit transaction limits a builder writes into the message. Builders carry no prices: a
-/// message built without `max_gas` has a zero gas offer, which marks it as not yet planned - plan
-/// it with `PhantasmaRpc::fees().plan` / [`crate::plan_fees`] before signing, or pass the offer
+/// message built without `max_gas` has a zero gas offer, which marks it as not yet planned. Plan it
+/// with `PhantasmaRpc::fees().plan` or [`crate::plan_fees`] before signing, or pass the offer
 /// here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TxLimits {
@@ -3466,8 +3468,8 @@ pub struct TxLimits {
     /// The storage-escrow ceiling in data-token atoms (`TxMsg::max_data`).
     pub max_data: u64,
     /// The expiry as a millisecond timestamp (`TxMsg::expiry`). 0 = [`DEFAULT_TX_EXPIRY`] from now.
-    /// A flow with a person in it - a hardware wallet confirming, a wallet-link round trip - should
-    /// set this from the chain's own window instead; see [`expiry_within`].
+    /// A flow with a person in it should set this from the chain's own window instead. Examples are
+    /// a hardware wallet confirming and a wallet-link round trip. See [`expiry_within`].
     pub expiry: i64,
 }
 
@@ -3476,7 +3478,7 @@ pub struct TxLimits {
 /// The chain reads the expiry in milliseconds and refuses anything at or beyond now + expiryWindow,
 /// where expiryWindow is a chain setting whose node default is 60,000 ms. A default has to hold on
 /// the shortest window a chain may run, and it is compared against the NODE's clock, so it also has
-/// to survive the two clocks disagreeing - hence a quarter of a minute of headroom rather than the
+/// to survive the two clocks disagreeing, so it keeps a quarter of a minute of headroom and not the
 /// whole minute. Chains that allow longer report it as expiryWindow in getGasConfig, reachable as
 /// `PhantasmaRpc::fees().chain_params()`.
 pub const DEFAULT_TX_EXPIRY: Duration = Duration::from_secs(45);
@@ -3973,7 +3975,10 @@ pub fn build_token_info(
             return builder("token schemas are required for NFTs");
         }
         TokenFlags::NON_FUNGIBLE
-    } else if !max_supply.is_8_byte_safe() {
+    } else if max_supply.0.is_zero() || !max_supply.is_8_byte_safe() {
+        // An unlimited supply (zero) has no int64 bound, so the chain requires the big-fungible
+        // flag for it and refuses the creation otherwise. That is the same rule as a supply past
+        // int64.
         TokenFlags::BIG_FUNGIBLE
     } else {
         TokenFlags::NONE
@@ -4101,8 +4106,9 @@ pub fn build_create_token_tx(
     ))
 }
 
-/// Builds a CreateToken call, plans it against `config` - unless `options.limits` fixes the
-/// offer - and signs it with the creator's keys. See [`crate::plan_and_sign_with_keys`].
+/// Builds a CreateToken call, plans it against `config` and signs it with the creator's keys. A
+/// call whose offer `options.limits` already fixes is signed as it is. See
+/// [`crate::plan_and_sign_with_keys`].
 pub fn build_create_token_tx_and_sign(
     token_info: TokenInfo,
     signer: &PhantasmaKeys,
@@ -4390,9 +4396,11 @@ pub fn sign_and_serialize_tx_msg_with_keys(
     serialize(&sign_tx_msg_with_keys(msg, keys)?)
 }
 
-/// Signs a message with any [`TxSigner`]s - keys, hardware wallets, remote services - one per
-/// witness. Every signer signs the same serialized message; a signer that must witness twice (the
-/// same account paying the gas and owning the tokens) is asked once and its signature reused.
+/// Signs a message with any [`TxSigner`]s, one per witness. A signer can hold keys, drive a
+/// hardware wallet or call a remote service. Every signer signs the same serialized message.
+///
+/// One account can fill two witness slots, when it pays the gas and owns the tokens. Such a signer
+/// is asked once and its signature is reused.
 pub async fn sign_tx_msg_with(msg: &TxMsg, signers: &[&dyn TxSigner]) -> Result<SignedTxMsg> {
     assert_planned(msg)?;
     let addresses = signers
@@ -4440,8 +4448,8 @@ fn assert_planned(msg: &TxMsg) -> Result<()> {
 // Pairs every witness slot of the envelope with the signer (by index) that owns its address. For
 // the types whose witness set the node fixes (native transfers, mints, burns and their gas-payer
 // variants) the slots come in envelope order regardless of how the signers were passed, and the
-// signer set must match the required addresses exactly - a missing owner key or a stray extra key
-// is a caller mistake the node would reject later at a cost. For the witness-array types the
+// signer set must match the required addresses exactly. A missing owner key or a stray extra key is
+// a caller mistake, and the node would reject it later at a cost. For the witness-array types the
 // caller's order is the envelope order, and the gas payer must be among them.
 fn witness_slots(msg: &TxMsg, addresses: &[Bytes32]) -> Result<Vec<(Bytes32, usize)>> {
     let Some(required) = required_witnesses(msg) else {
@@ -4507,10 +4515,12 @@ pub fn unpack_nft_address(address: &Bytes32) -> (u64, u64) {
     )
 }
 
-/// Whether a 32-byte address is an NFT-derived address - the address every minted instance owns,
-/// which assets are sent to when they are infused into that NFT. The form is syntactic, the same
-/// test the chain applies: fifteen zero bytes, a 0x01 marker, then a nonzero token id and a nonzero
-/// instance id. `plan_fees` uses it to price the recipient's owner lookup.
+/// Whether a 32-byte address is an NFT-derived address. Every minted instance owns such an address,
+/// and assets infused into that NFT are sent to it.
+///
+/// The test is syntactic and is the one the chain applies: fifteen zero bytes, a 0x01 marker, then a
+/// nonzero token id and a nonzero instance id. `plan_fees` uses it to price the recipient's owner
+/// lookup.
 pub fn is_nft_address(address: &Bytes32) -> bool {
     if address.0[15] != 1 || address.0[..15].iter().any(|byte| *byte != 0) {
         return false;
