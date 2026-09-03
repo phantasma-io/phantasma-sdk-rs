@@ -1,8 +1,8 @@
 //! estimateTransaction response decoding + Tier-2 fee-estimate conversion.
 //!
 //! The node serializes 64-bit amounts as decimal strings (JSON-number precision). A completed
-//! estimate must convert into the same NativeFeeEstimate the Tier-1 estimator produces, so wallet
-//! code consumes both tiers identically. The same fixtures exist in every SDK (parity suite).
+//! estimate must convert into the same FeeQuote the offline calculator produces, so wallet code
+//! consumes both identically. The same fixtures exist in every SDK (parity suite).
 
 use phantasma_sdk::rpc::EstimateTransactionResult;
 
@@ -35,7 +35,7 @@ const ABORTED_JSON: &str = r#"{
 fn completed_estimate_converts() {
     let result: EstimateTransactionResult = serde_json::from_str(COMPLETED_JSON).unwrap();
     assert!(!result.would_abort);
-    let estimate = result.to_fee_estimate().unwrap();
+    let estimate = result.to_fee_quote().unwrap();
     // Above-2^53 value survives exactly because it rides a string.
     assert_eq!(estimate.max_gas, 100_000_000_000_000_000);
     assert_eq!(estimate.max_data, 400_000);
@@ -48,7 +48,7 @@ fn completed_estimate_converts() {
 fn aborted_estimate_refuses_conversion() {
     let result: EstimateTransactionResult = serde_json::from_str(ABORTED_JSON).unwrap();
     assert!(result.would_abort);
-    let err = result.to_fee_estimate().unwrap_err();
+    let err = result.to_fee_quote().unwrap_err();
     assert!(err.to_string().contains("gas fees"));
 }
 
@@ -57,5 +57,5 @@ fn aborted_estimate_refuses_conversion() {
 fn missing_field_fails() {
     let result: EstimateTransactionResult =
         serde_json::from_str(r#"{"wouldAbort": false}"#).unwrap();
-    assert!(result.to_fee_estimate().is_err());
+    assert!(result.to_fee_quote().is_err());
 }

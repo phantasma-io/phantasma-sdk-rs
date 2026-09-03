@@ -20,12 +20,13 @@ use serde_json::{json, Value};
 
 use crate::carbon::{
     parse_create_token_result, parse_create_token_series_result, serialize, sign_tx_msg, Bytes32,
-    GasConfig, NativeFeeEstimate, SignedTxMsg, TxMsg,
+    GasConfig, SignedTxMsg, TxMsg,
 };
 use crate::crypto::PhantasmaKeys;
 use crate::encoding::{decode_hex, encode_hex};
 use crate::error::{rpc, PhantasmaError, Result};
 use crate::extended_events::EventData;
+use crate::fees::FeeQuote;
 use crate::transaction::{tx_state_is_fault, tx_state_is_success, Transaction};
 use crate::vm::VMObject;
 
@@ -2090,12 +2091,12 @@ pub struct EstimateTransactionResult {
 }
 
 impl EstimateTransactionResult {
-    /// Converts a completed estimate into the same [`NativeFeeEstimate`] the Tier-1 estimator
-    /// produces, so wallet code consumes both tiers identically: `max_gas`/`max_data` are the
-    /// recommended ceilings and `expected_gas_bill` is the exact settled bill. Errors when
-    /// `would_abort` is set - an aborted simulation has no recommendations (retry with a higher
-    /// offer or fall back to the Tier-1 estimator) - and on malformed numeric strings.
-    pub fn to_fee_estimate(&self) -> Result<NativeFeeEstimate> {
+    /// Converts a completed estimate into the same [`FeeQuote`] the offline calculator produces,
+    /// so wallet code consumes both identically: `max_gas`/`max_data` are the recommended ceilings
+    /// and `expected_gas_bill` is the exact settled bill. Errors when `would_abort` is set - an
+    /// aborted simulation has no recommendations (retry with a higher offer or fall back to the
+    /// offline calculator) - and on malformed numeric strings.
+    pub fn to_fee_quote(&self) -> Result<FeeQuote> {
         if self.would_abort {
             return Err(PhantasmaError::Rpc {
                 code: None,
@@ -2105,7 +2106,7 @@ impl EstimateTransactionResult {
                 ),
             });
         }
-        Ok(NativeFeeEstimate {
+        Ok(FeeQuote {
             max_gas: parse_estimate_u64(&self.recommended_max_gas, "recommendedMaxGas")?,
             max_data: parse_estimate_u64(&self.recommended_max_data, "recommendedMaxData")?,
             expected_gas_bill: parse_estimate_u64(&self.gas_bill_kcal_base, "gasBillKcalBase")?,
