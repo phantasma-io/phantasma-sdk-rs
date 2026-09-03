@@ -5,13 +5,13 @@ use phantasma_sdk::{
     deserialize, parse_token_schemas_json, serialize, serialize_token_schemas,
     serialize_token_schemas_hex, token_schemas_from_json, vm_type_from_string, vm_type_name,
     BurnFungibleArgs, BurnNonFungibleArgs, Bytes32, ChainConfig, CreateMintedTokenSeriesArgs,
-    CreateSeriesFeeOptions, CreateTokenSeriesArgs, GasConfig, IntX, MarketConfig,
-    MarketConfigFlags, MarketSellTokenByIdArgs, MintFungibleArgs, MintNFTFeeOptions,
-    MintPhantasmaNonFungibleArgs, ModuleId, PhantasmaNFTMintInfo, PhantasmaNFTMintResult,
-    SeriesInfo, SmallString, TokenContractMethod, TokenListing, TokenSchemaField, TokensConfig,
-    TokensConfigFlags, TransferFungibleArgs, TransferNonFungibleArgs, TxMsgCall, TxPayload, TxType,
-    UpdateSeriesMetadataArgs, UpdateTokenMetadataArgs, VMDynamicStruct, VMDynamicVariable,
-    VMNamedDynamicVariable, VMStructFlags, VMStructSchema, VMType,
+    CreateTokenSeriesArgs, GasConfig, IntX, MarketConfig, MarketConfigFlags,
+    MarketSellTokenByIdArgs, MintFungibleArgs, MintPhantasmaNonFungibleArgs, ModuleId,
+    PhantasmaNFTMintInfo, PhantasmaNFTMintResult, SeriesInfo, SmallString, TokenContractMethod,
+    TokenListing, TokenSchemaField, TokensConfig, TokensConfigFlags, TransferFungibleArgs,
+    TransferNonFungibleArgs, TxLimits, TxMsgCall, TxPayload, TxType, UpdateSeriesMetadataArgs,
+    UpdateTokenMetadataArgs, VMDynamicStruct, VMDynamicVariable, VMNamedDynamicVariable,
+    VMStructFlags, VMStructSchema, VMType,
 };
 
 fn repeated_bytes32(value: u8) -> Bytes32 {
@@ -356,7 +356,7 @@ fn market_by_id_args_and_schema_json_helpers_match_python() {
 }
 
 #[test]
-fn phantasma_nft_tx_helper_uses_call_payload_and_fee_defaults() {
+fn phantasma_nft_tx_helper_uses_call_payload_and_the_limits_given() {
     let sender = repeated_bytes32(0x11);
     let receiver = repeated_bytes32(0x22);
     let tx = build_mint_phantasma_non_fungible_single_tx(
@@ -366,13 +366,16 @@ fn phantasma_nft_tx_helper_uses_call_payload_and_fee_defaults() {
         receiver,
         vec![0xaa, 0xbb],
         vec![],
-        Some(MintNFTFeeOptions::default()),
-        123,
-        999,
+        TxLimits {
+            max_data: 123,
+            expiry: 999,
+            ..TxLimits::default()
+        },
     )
     .unwrap();
     assert_eq!(tx.tx_type, TxType::Call);
     assert_eq!(tx.expiry, 999);
+    assert_eq!(tx.max_gas, 0);
     assert_eq!(tx.max_data, 123);
     assert_eq!(tx.gas_from, sender);
     let TxPayload::Call(TxMsgCall {
@@ -392,29 +395,17 @@ fn phantasma_nft_tx_helper_uses_call_payload_and_fee_defaults() {
     let decoded: MintPhantasmaNonFungibleArgs = deserialize(args).unwrap();
     assert_eq!(decoded.token_id, 42);
     assert_eq!(decoded.address, receiver);
-    assert!(CreateSeriesFeeOptions::default().calculate_max_gas() > 0);
-    assert!(MintNFTFeeOptions::default().calculate_max_gas() > 0);
 }
 
 #[test]
-fn fee_options_scale_only_count_sensitive_mint_fees() {
-    let mint_fees = MintNFTFeeOptions {
-        gas_fee_base: 10,
-        fee_multiplier: 1_000,
-    };
-    assert_eq!(mint_fees.calculate_max_gas(), 10_000);
-    assert_eq!(mint_fees.calculate_max_gas_for_count(3).unwrap(), 30_000);
-    assert!(mint_fees.calculate_max_gas_for_count(0).is_err());
-
-    let series_fees = CreateSeriesFeeOptions {
-        gas_fee_base: 10,
-        fee_multiplier: 30,
-        gas_fee_create_series_base: 20,
-    };
-    assert_eq!(series_fees.calculate_max_gas(), 900);
-
+fn phantasma_nft_tx_helper_keeps_the_offer_given_and_refuses_an_empty_mint() {
     let sender = repeated_bytes32(0x11);
     let receiver = repeated_bytes32(0x22);
+    let limits = TxLimits {
+        max_gas: 30_000,
+        max_data: 123,
+        expiry: 999,
+    };
     let tx = build_mint_phantasma_non_fungible_tx(
         42,
         sender,
@@ -436,20 +427,9 @@ fn fee_options_scale_only_count_sensitive_mint_fees() {
                 ram: vec![],
             },
         ],
-        Some(mint_fees),
-        123,
-        999,
+        limits,
     )
     .unwrap();
     assert_eq!(tx.max_gas, 30_000);
-    assert!(build_mint_phantasma_non_fungible_tx(
-        42,
-        sender,
-        receiver,
-        vec![],
-        Some(MintNFTFeeOptions::default()),
-        123,
-        999,
-    )
-    .is_err());
+    assert!(build_mint_phantasma_non_fungible_tx(42, sender, receiver, vec![], limits).is_err());
 }

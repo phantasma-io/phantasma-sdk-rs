@@ -7,7 +7,7 @@
 
 use std::fmt;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -20,6 +20,7 @@ use crate::binary::{ensure_u32_len, signed_word_256, signed_word_to_big_int};
 use crate::crypto::{Address, AddressKind, PhantasmaKeys, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use crate::encoding::decode_hex;
 use crate::error::{builder, crypto, serialization, PhantasmaError, Result};
+use crate::fees::{plan_and_sign_with_keys, PlanAndSignOptions};
 
 pub trait CarbonSerializable: Sized {
     fn write_carbon(&self, writer: &mut CarbonWriter) -> Result<()>;
@@ -3454,100 +3455,305 @@ impl CarbonSerializable for SignedTxMsg {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FeeOptions {
-    pub gas_fee_base: u64,
-    pub fee_multiplier: u64,
+/// The explicit transaction limits a builder writes into the message. Builders carry no prices: a
+/// message built without `max_gas` has a zero gas offer, which marks it as not yet planned - plan
+/// it with `PhantasmaRpc::fees().plan` / [`crate::plan_fees`] before signing, or pass the offer
+/// here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TxLimits {
+    /// The gas offer in kcal-base (`TxMsg::max_gas`). 0 = unplanned.
+    pub max_gas: u64,
+    /// The storage-escrow ceiling in data-token atoms (`TxMsg::max_data`).
+    pub max_data: u64,
+    /// The expiry as a millisecond timestamp (`TxMsg::expiry`). 0 = [`DEFAULT_TX_EXPIRY`] from now.
+    /// A flow with a person in it - a hardware wallet confirming, a wallet-link round trip - should
+    /// set this from the chain's own window instead; see [`expiry_within`].
+    pub expiry: i64,
 }
 
-impl Default for FeeOptions {
-    fn default() -> Self {
-        Self {
-            gas_fee_base: 10_000,
-            fee_multiplier: 1_000,
-        }
+/// The default lifetime of a message a builder stamps.
+///
+/// The chain reads the expiry in milliseconds and refuses anything at or beyond now + expiryWindow,
+/// where expiryWindow is a chain setting whose node default is 60,000 ms. A default has to hold on
+/// the shortest window a chain may run, and it is compared against the NODE's clock, so it also has
+/// to survive the two clocks disagreeing - hence a quarter of a minute of headroom rather than the
+/// whole minute. Chains that allow longer report it as expiryWindow in getGasConfig, reachable as
+/// `PhantasmaRpc::fees().chain_params()`.
+pub const DEFAULT_TX_EXPIRY: Duration = Duration::from_secs(45);
+
+/// The expiry for a message built to be signed and sent now.
+pub fn default_expiry() -> i64 {
+    now_unix_millis() + DEFAULT_TX_EXPIRY.as_millis() as i64
+}
+
+/// The latest expiry a chain with this window will still admit, less a margin for the clock the
+/// node compares it against. Use it when a person sits between building a transaction and signing
+/// it: the chain's window is usually far longer than [`DEFAULT_TX_EXPIRY`], and the whole of it is
+/// available.
+///
+/// `expiry_window` is the chain's window, from `PhantasmaRpc::fees().chain_params()`. `margin` is
+/// the headroom for clock skew and the trip to the node; zero means 5 seconds.
+pub fn expiry_within(expiry_window: Duration, margin: Duration) -> Result<i64> {
+    if expiry_window.is_zero() {
+        return builder("expiry_within: expiry_window must be positive");
+    }
+    let margin = if margin.is_zero() {
+        Duration::from_secs(5)
+    } else {
+        margin
+    };
+    let lifetime = expiry_window
+        .checked_sub(margin)
+        .filter(|lifetime| !lifetime.is_zero())
+        .ok_or_else(|| {
+            PhantasmaError::Builder(format!(
+                "expiry_within: a margin of {margin:?} leaves nothing of a {expiry_window:?} window"
+            ))
+        })?;
+    let lifetime = i64::try_from(lifetime.as_millis())
+        .map_err(|_| PhantasmaError::Builder("expiry_within: window overflow".into()))?;
+    Ok(now_unix_millis() + lifetime)
+}
+
+// Writes the limits into a message the builders assemble.
+fn apply_tx_limits(mut msg: TxMsg, limits: TxLimits) -> TxMsg {
+    msg.max_gas = limits.max_gas;
+    msg.max_data = limits.max_data;
+    msg.expiry = if limits.expiry == 0 {
+        default_expiry()
+    } else {
+        limits.expiry
+    };
+    msg
+}
+
+// The native transaction types come in pairs: the plain form, where the account moving the tokens
+// also pays the gas and signs alone, and the gas-payer form, where a second account pays the gas
+// and both sign. Naming a gas payer in the parameters selects the second form. The builders
+// assemble the message only: fees are planned afterwards from the message itself
+// (`PhantasmaRpc::fees().plan`, `plan_fees`) and the witnesses sign with `sign_tx_msg` /
+// `sign_tx_msg_with`. Unless a max_gas is passed the message carries a zero offer and cannot be
+// signed until it is planned.
+
+/// A fungible transfer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransferFungibleParams {
+    pub limits: TxLimits,
+    /// The account whose tokens move; always a witness.
+    pub from: Bytes32,
+    /// A different account that pays the gas and becomes the first witness. `None` = the sender
+    /// pays.
+    pub gas_payer: Option<Bytes32>,
+    pub to: Bytes32,
+    pub token_id: u64,
+    /// In the token's atoms (u64; big-fungible tokens need a script transfer).
+    pub amount: u64,
+}
+
+/// An NFT transfer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransferNonFungibleParams {
+    pub limits: TxLimits,
+    pub from: Bytes32,
+    pub gas_payer: Option<Bytes32>,
+    pub to: Bytes32,
+    pub token_id: u64,
+    /// One instance uses the single-instance type, several the multi-instance type.
+    pub instance_ids: Vec<u64>,
+}
+
+/// A fungible mint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MintFungibleParams {
+    pub limits: TxLimits,
+    /// The token owner: pays the gas and signs.
+    pub owner: Bytes32,
+    pub to: Bytes32,
+    pub token_id: u64,
+    /// In the token's atoms. Mint and burn carry an [`IntX`] because they also serve big-fungible
+    /// tokens, whose balances do not fit a u64; `IntX::from` wraps an ordinary amount.
+    pub amount: IntX,
+}
+
+/// A fungible burn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BurnFungibleParams {
+    pub limits: TxLimits,
+    pub from: Bytes32,
+    pub gas_payer: Option<Bytes32>,
+    pub token_id: u64,
+    /// In the token's atoms, as an [`IntX`] for the same reason as a mint.
+    pub amount: IntX,
+}
+
+/// An NFT burn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BurnNonFungibleParams {
+    pub limits: TxLimits,
+    pub from: Bytes32,
+    pub gas_payer: Option<Bytes32>,
+    pub token_id: u64,
+    pub instance_id: u64,
+}
+
+/// Builds a fungible transfer: the plain type, or the gas-payer type when a gas payer is named.
+pub fn build_transfer_fungible_tx(p: TransferFungibleParams) -> TxMsg {
+    match p.gas_payer {
+        Some(gas_payer) => native_tx(
+            TxType::TransferFungibleGasPayer,
+            gas_payer,
+            p.limits,
+            TxPayload::TransferFungibleGasPayer(TxMsgTransferFungibleGasPayer {
+                to: p.to,
+                from_address: p.from,
+                token_id: p.token_id,
+                amount: p.amount,
+            }),
+        ),
+        None => native_tx(
+            TxType::TransferFungible,
+            p.from,
+            p.limits,
+            TxPayload::TransferFungible(TxMsgTransferFungible {
+                to: p.to,
+                token_id: p.token_id,
+                amount: p.amount,
+            }),
+        ),
     }
 }
 
-impl FeeOptions {
-    pub fn calculate_max_gas(&self) -> u64 {
-        self.gas_fee_base * self.fee_multiplier
+/// Builds an NFT transfer: the single- or multi-instance type by the instance count, in the plain
+/// or the gas-payer form.
+pub fn build_transfer_non_fungible_tx(p: TransferNonFungibleParams) -> Result<TxMsg> {
+    let Some(&first) = p.instance_ids.first() else {
+        return builder("instance_ids must not be empty");
+    };
+    let single = p.instance_ids.len() == 1;
+    Ok(match (p.gas_payer, single) {
+        (Some(gas_payer), true) => native_tx(
+            TxType::TransferNonFungibleSingleGasPayer,
+            gas_payer,
+            p.limits,
+            TxPayload::TransferNonFungibleSingleGasPayer(TxMsgTransferNonFungibleSingleGasPayer {
+                to: p.to,
+                from_address: p.from,
+                token_id: p.token_id,
+                instance_id: first,
+            }),
+        ),
+        (Some(gas_payer), false) => native_tx(
+            TxType::TransferNonFungibleMultiGasPayer,
+            gas_payer,
+            p.limits,
+            TxPayload::TransferNonFungibleMultiGasPayer(TxMsgTransferNonFungibleMultiGasPayer {
+                to: p.to,
+                from_address: p.from,
+                token_id: p.token_id,
+                instance_ids: p.instance_ids,
+            }),
+        ),
+        (None, true) => native_tx(
+            TxType::TransferNonFungibleSingle,
+            p.from,
+            p.limits,
+            TxPayload::TransferNonFungibleSingle(TxMsgTransferNonFungibleSingle {
+                to: p.to,
+                token_id: p.token_id,
+                instance_id: first,
+            }),
+        ),
+        (None, false) => native_tx(
+            TxType::TransferNonFungibleMulti,
+            p.from,
+            p.limits,
+            TxPayload::TransferNonFungibleMulti(TxMsgTransferNonFungibleMulti {
+                to: p.to,
+                token_id: p.token_id,
+                instance_ids: p.instance_ids,
+            }),
+        ),
+    })
+}
+
+/// Builds a fungible mint, paid and signed by the token owner.
+pub fn build_mint_fungible_tx(p: MintFungibleParams) -> TxMsg {
+    native_tx(
+        TxType::MintFungible,
+        p.owner,
+        p.limits,
+        TxPayload::MintFungible(TxMsgMintFungible {
+            token_id: p.token_id,
+            to: p.to,
+            amount: p.amount,
+        }),
+    )
+}
+
+/// Builds a fungible burn in the plain or the gas-payer form.
+pub fn build_burn_fungible_tx(p: BurnFungibleParams) -> TxMsg {
+    match p.gas_payer {
+        Some(gas_payer) => native_tx(
+            TxType::BurnFungibleGasPayer,
+            gas_payer,
+            p.limits,
+            TxPayload::BurnFungibleGasPayer(TxMsgBurnFungibleGasPayer {
+                token_id: p.token_id,
+                from_address: p.from,
+                amount: p.amount,
+            }),
+        ),
+        None => native_tx(
+            TxType::BurnFungible,
+            p.from,
+            p.limits,
+            TxPayload::BurnFungible(TxMsgBurnFungible {
+                token_id: p.token_id,
+                amount: p.amount,
+            }),
+        ),
     }
+}
 
-    pub fn calculate_max_gas_for_count(&self, count: u64) -> Result<u64> {
-        if count == 0 {
-            return builder("FeeOptions::calculate_max_gas_for_count count must be positive");
-        }
-        let base = self
-            .gas_fee_base
-            .checked_mul(self.fee_multiplier)
-            .ok_or_else(|| {
-                PhantasmaError::Builder("FeeOptions::calculate_max_gas_for_count overflow".into())
-            })?;
-        base.checked_mul(count).ok_or_else(|| {
-            PhantasmaError::Builder("FeeOptions::calculate_max_gas_for_count overflow".into())
-        })
+/// Builds an NFT burn in the plain or the gas-payer form.
+pub fn build_burn_non_fungible_tx(p: BurnNonFungibleParams) -> TxMsg {
+    match p.gas_payer {
+        Some(gas_payer) => native_tx(
+            TxType::BurnNonFungibleGasPayer,
+            gas_payer,
+            p.limits,
+            TxPayload::BurnNonFungibleGasPayer(TxMsgBurnNonFungibleGasPayer {
+                token_id: p.token_id,
+                from_address: p.from,
+                instance_id: p.instance_id,
+            }),
+        ),
+        None => native_tx(
+            TxType::BurnNonFungible,
+            p.from,
+            p.limits,
+            TxPayload::BurnNonFungible(TxMsgBurnNonFungible {
+                token_id: p.token_id,
+                instance_id: p.instance_id,
+            }),
+        ),
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateTokenFeeOptions {
-    pub gas_fee_base: u64,
-    pub fee_multiplier: u64,
-    pub gas_fee_create_token_base: u64,
-    pub gas_fee_create_token_symbol: u64,
+fn native_tx(tx_type: TxType, gas_from: Bytes32, limits: TxLimits, msg: TxPayload) -> TxMsg {
+    apply_tx_limits(
+        TxMsg {
+            tx_type,
+            expiry: 0,
+            max_gas: 0,
+            max_data: 0,
+            gas_from,
+            payload: SmallString::default(),
+            msg,
+        },
+        limits,
+    )
 }
-
-impl Default for CreateTokenFeeOptions {
-    fn default() -> Self {
-        Self {
-            gas_fee_base: 10_000,
-            fee_multiplier: 10_000,
-            gas_fee_create_token_base: 10_000_000_000,
-            gas_fee_create_token_symbol: 10_000_000_000,
-        }
-    }
-}
-
-impl CreateTokenFeeOptions {
-    pub fn calculate_max_gas_for_symbol(&self, symbol: &SmallString) -> u64 {
-        let shift = symbol.0.len().saturating_sub(1);
-        let symbol_part = if shift < 64 {
-            self.gas_fee_create_token_symbol >> shift
-        } else {
-            0
-        };
-        (self.gas_fee_base + self.gas_fee_create_token_base + symbol_part) * self.fee_multiplier
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateSeriesFeeOptions {
-    pub gas_fee_base: u64,
-    pub fee_multiplier: u64,
-    pub gas_fee_create_series_base: u64,
-}
-
-impl Default for CreateSeriesFeeOptions {
-    fn default() -> Self {
-        Self {
-            gas_fee_base: 10_000,
-            fee_multiplier: 10_000,
-            gas_fee_create_series_base: 2_500_000_000,
-        }
-    }
-}
-
-impl CreateSeriesFeeOptions {
-    pub fn calculate_max_gas(&self) -> u64 {
-        (self.gas_fee_base + self.gas_fee_create_series_base) * self.fee_multiplier
-    }
-}
-
-pub type MintNftFeeOptions = FeeOptions;
-
-#[allow(clippy::upper_case_acronyms)]
-pub type MintNFTFeeOptions = FeeOptions;
 
 pub fn now_unix_millis() -> i64 {
     SystemTime::now()
@@ -3876,311 +4082,158 @@ pub fn build_phantasma_nft_rom(
     write_dynamic_struct_with_schema(&VMDynamicStruct::new(fields), &public_schema)
 }
 
+/// Builds a CreateToken call. The message carries the limits given and nothing else: plan its fees
+/// from the message before signing, or pass the offer in `limits`.
 pub fn build_create_token_tx(
     token_info: TokenInfo,
     creator: Bytes32,
-    fees: Option<CreateTokenFeeOptions>,
-    max_data: u64,
-    expiry: i64,
+    limits: TxLimits,
 ) -> Result<TxMsg> {
-    let fees = fees.unwrap_or_default();
-    Ok(TxMsg {
-        tx_type: TxType::Call,
-        expiry: if expiry == 0 {
-            now_unix_millis() + 60_000
-        } else {
-            expiry
-        },
-        max_gas: fees.calculate_max_gas_for_symbol(&token_info.symbol),
-        max_data,
-        gas_from: creator,
-        payload: SmallString::default(),
-        msg: TxPayload::Call(TxMsgCall {
+    Ok(call_tx(
+        creator,
+        limits,
+        TxMsgCall {
             module_id: ModuleId::Token as u32,
             method_id: TokenContractMethod::CreateToken as u32,
             args: serialize(&token_info)?,
             sections: None,
-        }),
-    })
+        },
+    ))
 }
 
+/// Builds a CreateToken call, plans it against `config` - unless `options.limits` fixes the
+/// offer - and signs it with the creator's keys. See [`crate::plan_and_sign_with_keys`].
 pub fn build_create_token_tx_and_sign(
     token_info: TokenInfo,
     signer: &PhantasmaKeys,
-) -> Result<Vec<u8>> {
-    build_create_token_tx_and_sign_with_options(token_info, signer, None, 100_000_000, 0)
-}
-
-pub fn build_create_token_tx_and_sign_with_options(
-    token_info: TokenInfo,
-    signer: &PhantasmaKeys,
-    fees: Option<CreateTokenFeeOptions>,
-    max_data: u64,
-    expiry: i64,
+    config: Option<&GasConfig>,
+    options: &PlanAndSignOptions,
 ) -> Result<Vec<u8>> {
     let creator = bytes32_from_public_key(&signer.public_key())?;
-    let msg = build_create_token_tx(token_info, creator, fees, max_data, expiry)?;
-    sign_and_serialize_tx_msg(&msg, signer)
+    let msg = build_create_token_tx(token_info, creator, options.limits)?;
+    plan_and_sign_with_keys(&msg, &[signer], config, options)
 }
 
 pub fn build_create_token_tx_and_sign_hex(
     token_info: TokenInfo,
     signer: &PhantasmaKeys,
+    config: Option<&GasConfig>,
+    options: &PlanAndSignOptions,
 ) -> Result<String> {
     Ok(hex::encode(build_create_token_tx_and_sign(
-        token_info, signer,
+        token_info, signer, config, options,
     )?))
 }
 
-pub fn build_create_token_tx_and_sign_hex_with_options(
-    token_info: TokenInfo,
-    signer: &PhantasmaKeys,
-    fees: Option<CreateTokenFeeOptions>,
-    max_data: u64,
-    expiry: i64,
-) -> Result<String> {
-    Ok(hex::encode(build_create_token_tx_and_sign_with_options(
-        token_info, signer, fees, max_data, expiry,
-    )?))
-}
-
+/// Builds a CreateTokenSeries call with the limits given; see [`build_create_token_tx`].
 pub fn build_create_token_series_tx(
     token_id: u64,
     series_info: SeriesInfo,
     creator: Bytes32,
-    fees: Option<CreateSeriesFeeOptions>,
-    max_data: u64,
-    expiry: i64,
+    limits: TxLimits,
 ) -> Result<TxMsg> {
-    let fees = fees.unwrap_or_default();
     let args = CreateTokenSeriesArgs {
         token_id,
         info: series_info,
     };
-    Ok(TxMsg {
-        tx_type: TxType::Call,
-        expiry: if expiry == 0 {
-            now_unix_millis() + 60_000
-        } else {
-            expiry
-        },
-        max_gas: fees.calculate_max_gas(),
-        max_data,
-        gas_from: creator,
-        payload: SmallString::default(),
-        msg: TxPayload::Call(TxMsgCall {
+    Ok(call_tx(
+        creator,
+        limits,
+        TxMsgCall {
             module_id: ModuleId::Token as u32,
             method_id: TokenContractMethod::CreateTokenSeries as u32,
             args: serialize(&args)?,
             sections: None,
-        }),
-    })
+        },
+    ))
 }
 
 pub fn build_create_token_series_tx_and_sign(
     token_id: u64,
     series_info: SeriesInfo,
     signer: &PhantasmaKeys,
-) -> Result<Vec<u8>> {
-    build_create_token_series_tx_and_sign_with_options(
-        token_id,
-        series_info,
-        signer,
-        None,
-        100_000_000,
-        0,
-    )
-}
-
-pub fn build_create_token_series_tx_and_sign_with_options(
-    token_id: u64,
-    series_info: SeriesInfo,
-    signer: &PhantasmaKeys,
-    fees: Option<CreateSeriesFeeOptions>,
-    max_data: u64,
-    expiry: i64,
+    config: Option<&GasConfig>,
+    options: &PlanAndSignOptions,
 ) -> Result<Vec<u8>> {
     let creator = bytes32_from_public_key(&signer.public_key())?;
-    let msg = build_create_token_series_tx(token_id, series_info, creator, fees, max_data, expiry)?;
-    sign_and_serialize_tx_msg(&msg, signer)
+    let msg = build_create_token_series_tx(token_id, series_info, creator, options.limits)?;
+    plan_and_sign_with_keys(&msg, &[signer], config, options)
 }
 
 pub fn build_create_token_series_tx_and_sign_hex(
     token_id: u64,
     series_info: SeriesInfo,
     signer: &PhantasmaKeys,
+    config: Option<&GasConfig>,
+    options: &PlanAndSignOptions,
 ) -> Result<String> {
     Ok(hex::encode(build_create_token_series_tx_and_sign(
         token_id,
         series_info,
         signer,
+        config,
+        options,
     )?))
 }
 
-pub fn build_create_token_series_tx_and_sign_hex_with_options(
-    token_id: u64,
-    series_info: SeriesInfo,
-    signer: &PhantasmaKeys,
-    fees: Option<CreateSeriesFeeOptions>,
-    max_data: u64,
-    expiry: i64,
-) -> Result<String> {
-    Ok(hex::encode(
-        build_create_token_series_tx_and_sign_with_options(
-            token_id,
-            series_info,
-            signer,
-            fees,
-            max_data,
-            expiry,
-        )?,
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_mint_non_fungible_tx(
-    token_id: u64,
-    series_id: u32,
-    sender: Bytes32,
-    receiver: Bytes32,
-    rom: Vec<u8>,
-    ram: Vec<u8>,
-    fees: Option<FeeOptions>,
-    max_data: u64,
-    expiry: i64,
-) -> TxMsg {
-    let fees = fees.unwrap_or_default();
-    TxMsg {
-        tx_type: TxType::MintNonFungible,
-        expiry: if expiry == 0 {
-            now_unix_millis() + 60_000
-        } else {
-            expiry
-        },
-        max_gas: fees.calculate_max_gas(),
-        max_data,
-        gas_from: sender,
-        payload: SmallString::default(),
-        msg: TxPayload::MintNonFungible(TxMsgMintNonFungible {
-            token_id,
-            to: receiver,
-            series_id,
-            rom,
-            ram,
-        }),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_mint_non_fungible_tx_and_sign(
-    token_id: u64,
-    series_id: u32,
-    signer: &PhantasmaKeys,
-    receiver: Bytes32,
-    rom: Vec<u8>,
-    ram: Vec<u8>,
-    fees: Option<FeeOptions>,
-    max_data: u64,
-    expiry: i64,
-) -> Result<Vec<u8>> {
-    let sender = bytes32_from_public_key(&signer.public_key())?;
-    sign_and_serialize_tx_msg(
-        &build_mint_non_fungible_tx(
-            token_id, series_id, sender, receiver, rom, ram, fees, max_data, expiry,
-        ),
-        signer,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_mint_non_fungible_tx_and_sign_hex(
-    token_id: u64,
-    series_id: u32,
-    signer: &PhantasmaKeys,
-    receiver: Bytes32,
-    rom: Vec<u8>,
-    ram: Vec<u8>,
-    fees: Option<FeeOptions>,
-    max_data: u64,
-    expiry: i64,
-) -> Result<String> {
-    Ok(hex::encode(build_mint_non_fungible_tx_and_sign(
-        token_id, series_id, signer, receiver, rom, ram, fees, max_data, expiry,
-    )?))
-}
-
+/// Builds a deterministic Phantasma NFT mint of one or more instances with the limits given; see
+/// [`build_create_token_tx`]. Phantasma NFTs are minted through this call only: the native
+/// MintNonFungible message exists for the chain's own use, and the SDK builds no transaction for
+/// it.
 pub fn build_mint_phantasma_non_fungible_tx(
     token_id: u64,
     sender: Bytes32,
     receiver: Bytes32,
     tokens: Vec<PhantasmaNFTMintInfo>,
-    fees: Option<FeeOptions>,
-    max_data: u64,
-    expiry: i64,
+    limits: TxLimits,
 ) -> Result<TxMsg> {
-    let fees = fees.unwrap_or_default();
-    let max_gas =
-        fees.calculate_max_gas_for_count(u64::try_from(tokens.len()).map_err(|_| {
-            PhantasmaError::Builder("MintPhantasmaNonFungible token count overflow".into())
-        })?)?;
+    if tokens.is_empty() {
+        return builder("MintPhantasmaNonFungible needs at least one instance");
+    }
     let args = MintPhantasmaNonFungibleArgs {
         token_id,
         address: receiver,
         tokens,
     };
-    Ok(TxMsg {
-        tx_type: TxType::Call,
-        expiry: if expiry == 0 {
-            now_unix_millis() + 60_000
-        } else {
-            expiry
-        },
-        max_gas,
-        max_data,
-        gas_from: sender,
-        payload: SmallString::default(),
-        msg: TxPayload::Call(TxMsgCall {
+    Ok(call_tx(
+        sender,
+        limits,
+        TxMsgCall {
             module_id: ModuleId::Token as u32,
             method_id: TokenContractMethod::MintPhantasmaNonFungible as u32,
             args: serialize(&args)?,
             sections: None,
-        }),
-    })
+        },
+    ))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn build_mint_phantasma_non_fungible_tx_and_sign(
     token_id: u64,
     signer: &PhantasmaKeys,
     receiver: Bytes32,
     tokens: Vec<PhantasmaNFTMintInfo>,
-    fees: Option<FeeOptions>,
-    max_data: u64,
-    expiry: i64,
+    config: Option<&GasConfig>,
+    options: &PlanAndSignOptions,
 ) -> Result<Vec<u8>> {
     let sender = bytes32_from_public_key(&signer.public_key())?;
-    let msg = build_mint_phantasma_non_fungible_tx(
-        token_id, sender, receiver, tokens, fees, max_data, expiry,
-    )?;
-    sign_and_serialize_tx_msg(&msg, signer)
+    let msg =
+        build_mint_phantasma_non_fungible_tx(token_id, sender, receiver, tokens, options.limits)?;
+    plan_and_sign_with_keys(&msg, &[signer], config, options)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn build_mint_phantasma_non_fungible_tx_and_sign_hex(
     token_id: u64,
     signer: &PhantasmaKeys,
     receiver: Bytes32,
     tokens: Vec<PhantasmaNFTMintInfo>,
-    fees: Option<FeeOptions>,
-    max_data: u64,
-    expiry: i64,
+    config: Option<&GasConfig>,
+    options: &PlanAndSignOptions,
 ) -> Result<String> {
     Ok(hex::encode(build_mint_phantasma_non_fungible_tx_and_sign(
-        token_id, signer, receiver, tokens, fees, max_data, expiry,
+        token_id, signer, receiver, tokens, config, options,
     )?))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn build_mint_phantasma_non_fungible_single_tx(
     token_id: u64,
     phantasma_series_id: impl Into<BigInt>,
@@ -4188,9 +4241,7 @@ pub fn build_mint_phantasma_non_fungible_single_tx(
     receiver: Bytes32,
     public_rom: Vec<u8>,
     ram: Vec<u8>,
-    fees: Option<FeeOptions>,
-    max_data: u64,
-    expiry: i64,
+    limits: TxLimits,
 ) -> Result<TxMsg> {
     build_mint_phantasma_non_fungible_tx(
         token_id,
@@ -4201,9 +4252,7 @@ pub fn build_mint_phantasma_non_fungible_single_tx(
             rom: public_rom,
             ram,
         }],
-        fees,
-        max_data,
-        expiry,
+        limits,
     )
 }
 
@@ -4215,9 +4264,8 @@ pub fn build_mint_phantasma_non_fungible_single_tx_and_sign(
     receiver: Bytes32,
     public_rom: Vec<u8>,
     ram: Vec<u8>,
-    fees: Option<FeeOptions>,
-    max_data: u64,
-    expiry: i64,
+    config: Option<&GasConfig>,
+    options: &PlanAndSignOptions,
 ) -> Result<Vec<u8>> {
     let sender = bytes32_from_public_key(&signer.public_key())?;
     let msg = build_mint_phantasma_non_fungible_single_tx(
@@ -4227,11 +4275,9 @@ pub fn build_mint_phantasma_non_fungible_single_tx_and_sign(
         receiver,
         public_rom,
         ram,
-        fees,
-        max_data,
-        expiry,
+        options.limits,
     )?;
-    sign_and_serialize_tx_msg(&msg, signer)
+    plan_and_sign_with_keys(&msg, &[signer], config, options)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4242,9 +4288,8 @@ pub fn build_mint_phantasma_non_fungible_single_tx_and_sign_hex(
     receiver: Bytes32,
     public_rom: Vec<u8>,
     ram: Vec<u8>,
-    fees: Option<FeeOptions>,
-    max_data: u64,
-    expiry: i64,
+    config: Option<&GasConfig>,
+    options: &PlanAndSignOptions,
 ) -> Result<String> {
     Ok(hex::encode(
         build_mint_phantasma_non_fungible_single_tx_and_sign(
@@ -4254,11 +4299,25 @@ pub fn build_mint_phantasma_non_fungible_single_tx_and_sign_hex(
             receiver,
             public_rom,
             ram,
-            fees,
-            max_data,
-            expiry,
+            config,
+            options,
         )?,
     ))
+}
+
+fn call_tx(gas_from: Bytes32, limits: TxLimits, call: TxMsgCall) -> TxMsg {
+    apply_tx_limits(
+        TxMsg {
+            tx_type: TxType::Call,
+            expiry: 0,
+            max_gas: 0,
+            max_data: 0,
+            gas_from,
+            payload: SmallString::default(),
+            msg: TxPayload::Call(call),
+        },
+        limits,
+    )
 }
 
 /// Produces one witness of a Carbon transaction: keys held in memory, a hardware wallet, a remote

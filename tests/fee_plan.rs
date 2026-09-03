@@ -8,9 +8,9 @@ use phantasma_sdk::{
     estimate_native_fee, get_nft_address, is_nft_address, plan_fees, serialize, unpack_nft_address,
     Bytes32, FeePlanOptions, GasConfig, GovernanceContractMethod, InfusedAsset, IntX, ModuleId,
     NativeFeeKind, NativeFeeParams, PhantasmaKeys, PhantasmaNFTMintInfo, RegisterNameArgs,
-    SmallString, TxMsg, TxMsgBurnNonFungible, TxMsgCall, TxMsgCallMulti, TxMsgMintNonFungible,
-    TxMsgTransferFungible, TxMsgTransferFungibleGasPayer, TxMsgTransferNonFungibleMulti, TxPayload,
-    TxType,
+    SmallString, TxLimits, TxMsg, TxMsgBurnNonFungible, TxMsgCall, TxMsgCallMulti,
+    TxMsgMintNonFungible, TxMsgTransferFungible, TxMsgTransferFungibleGasPayer,
+    TxMsgTransferNonFungibleMulti, TxPayload, TxType,
 };
 
 const ICON: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==";
@@ -66,6 +66,13 @@ fn base_tx(tx_type: TxType, gas_from: Bytes32, msg: TxPayload) -> TxMsg {
     }
 }
 
+fn fixed_expiry() -> TxLimits {
+    TxLimits {
+        expiry: 1_759_711_416_000,
+        ..TxLimits::default()
+    }
+}
+
 fn transfer(to: Bytes32, token_id: u64) -> TxMsg {
     let (payer, _) = keys();
     base_tx(
@@ -103,7 +110,7 @@ fn create_token(symbol: &str, is_nft: bool, extra: &[(&str, &str)]) -> TxMsg {
         },
     )
     .unwrap();
-    build_create_token_tx(info, address_of(&creator), None, 0, 1_759_711_416_000).unwrap()
+    build_create_token_tx(info, address_of(&creator), fixed_expiry()).unwrap()
 }
 
 fn phantasma_mint(series_ids: &[i64], rom_bytes: usize, to: Bytes32) -> TxMsg {
@@ -116,16 +123,7 @@ fn phantasma_mint(series_ids: &[i64], rom_bytes: usize, to: Bytes32) -> TxMsg {
             ram: Vec::new(),
         })
         .collect();
-    build_mint_phantasma_non_fungible_tx(
-        9,
-        address_of(&owner),
-        to,
-        tokens,
-        None,
-        0,
-        1_759_711_416_000,
-    )
-    .unwrap()
+    build_mint_phantasma_non_fungible_tx(9, address_of(&owner), to, tokens, fixed_expiry()).unwrap()
 }
 
 // A native transfer is planned from the message alone: its signed size with one signature, the
@@ -329,9 +327,7 @@ fn reads_a_token_creation_out_of_its_call() {
 fn reads_a_series_creation_out_of_its_call() {
     let (creator, _) = keys();
     let info = build_series_info(5, 0, 0, address_of(&creator)).unwrap();
-    let msg =
-        build_create_token_series_tx(9, info, address_of(&creator), None, 0, 1_759_711_416_000)
-            .unwrap();
+    let msg = build_create_token_series_tx(9, info, address_of(&creator), fixed_expiry()).unwrap();
     let TxPayload::Call(call) = &msg.msg else {
         panic!("expected a call");
     };

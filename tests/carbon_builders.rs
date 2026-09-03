@@ -3,17 +3,18 @@ use std::fs;
 use num_bigint::BigInt;
 use phantasma_sdk::{
     build_and_serialize_token_schemas, build_create_token_series_tx, build_create_token_tx,
-    build_mint_non_fungible_tx, build_mint_non_fungible_tx_and_sign,
-    build_mint_non_fungible_tx_and_sign_hex, build_mint_phantasma_non_fungible_single_tx,
-    build_nft_rom, build_phantasma_nft_rom, build_series_info, build_token_info,
-    build_token_metadata, build_token_series_metadata, bytes32_from_phantasma_address,
-    bytes32_from_public_key, check_token_symbol, deserialize, get_nft_address,
-    parse_create_token_result, parse_create_token_series_result, parse_mint_non_fungible_result,
+    build_mint_phantasma_non_fungible_single_tx,
+    build_mint_phantasma_non_fungible_single_tx_and_sign,
+    build_mint_phantasma_non_fungible_single_tx_and_sign_hex, build_nft_rom,
+    build_phantasma_nft_rom, build_series_info, build_token_info, build_token_metadata,
+    build_token_series_metadata, bytes32_from_phantasma_address, bytes32_from_public_key,
+    check_token_symbol, deserialize, get_nft_address, parse_create_token_result,
+    parse_create_token_series_result, parse_mint_non_fungible_result,
     parse_mint_phantasma_non_fungible_result, prepare_standard_token_schemas, serialize,
     serialize_token_schemas_hex, sign_and_serialize_tx_msg_hex, unpack_nft_instance_id, Bytes32,
-    CallArgSection, CarbonReader, CarbonWriter, CreateSeriesFeeOptions, CreateTokenFeeOptions,
-    FeeOptions, IntX, MintPhantasmaNonFungibleArgs, MsgCallArgSections, PhantasmaKeys, SmallString,
-    TokenFlags, TxMsg, TxMsgBurnFungibleGasPayer, TxMsgCall, TxMsgMintFungible,
+    CallArgSection, CarbonReader, CarbonWriter, IntX, MintPhantasmaNonFungibleArgs,
+    MsgCallArgSections, PhantasmaKeys, PlanAndSignOptions, SmallString, TokenFlags, TxLimits,
+    TxMsg, TxMsgBurnFungibleGasPayer, TxMsgCall, TxMsgMintFungible, TxMsgMintNonFungible,
     TxMsgTransferFungible, TxMsgTransferFungibleGasPayer, TxPayload, TxType, VMDynamicStruct,
     VMNamedDynamicVariable, VMNamedVariableSchema, VMStructArray, VMStructSchema, VMType, VMValue,
 };
@@ -246,13 +247,16 @@ fn phantasma_nft_public_rom_and_tx_helpers_work() {
         receiver,
         rom,
         vec![],
-        Some(FeeOptions::default()),
-        123,
-        999,
+        TxLimits {
+            max_data: 123,
+            expiry: 999,
+            ..TxLimits::default()
+        },
     )
     .unwrap();
     assert_eq!(tx.tx_type, TxType::Call);
     assert_eq!(tx.expiry, 999);
+    assert_eq!(tx.max_gas, 0, "a builder writes no offer of its own");
     assert_eq!(tx.max_data, 123);
     assert_eq!(tx.gas_from, sender);
     let TxPayload::Call(call) = tx.msg else {
@@ -624,9 +628,11 @@ fn carbon_tx_builder_vector(case_id: &str) -> String {
                     &build_create_token_tx(
                         token_info,
                         sender_bytes,
-                        Some(CreateTokenFeeOptions::default()),
-                        100_000_000,
-                        1_759_711_416_000,
+                        TxLimits {
+                            max_gas: 106_250_100_000_000,
+                            max_data: 100_000_000,
+                            expiry: 1_759_711_416_000,
+                        },
                     )
                     .unwrap(),
                 )
@@ -642,9 +648,11 @@ fn carbon_tx_builder_vector(case_id: &str) -> String {
                         u64::MAX,
                         series_info,
                         sender_bytes,
-                        Some(CreateSeriesFeeOptions::default()),
-                        100_000_000,
-                        1_759_711_416_000,
+                        TxLimits {
+                            max_gas: 25_000_100_000_000,
+                            max_data: 100_000_000,
+                            expiry: 1_759_711_416_000,
+                        },
                     )
                     .unwrap(),
                 )
@@ -655,18 +663,24 @@ fn carbon_tx_builder_vector(case_id: &str) -> String {
             let schemas = prepare_standard_token_schemas(false);
             let nft_id = (BigInt::from(1u8) << 256) - BigInt::from(1u8);
             let rom = build_nft_rom(&schemas.rom, nft_id, &sample_nft_metadata(true)).unwrap();
+            // The native MintNonFungible message is the chain's own; the SDK builds no
+            // transaction for it, so the vector spells the message out.
             hex::encode_upper(
-                serialize(&build_mint_non_fungible_tx(
-                    u64::MAX,
-                    u32::MAX,
-                    sender_bytes,
-                    sender_bytes,
-                    rom,
-                    vec![],
-                    Some(FeeOptions::default()),
-                    100_000_000,
-                    1_759_711_416_000,
-                ))
+                serialize(&TxMsg {
+                    tx_type: TxType::MintNonFungible,
+                    expiry: 1_759_711_416_000,
+                    max_gas: 10_000_000,
+                    max_data: 100_000_000,
+                    gas_from: sender_bytes,
+                    payload: SmallString::default(),
+                    msg: TxPayload::MintNonFungible(TxMsgMintNonFungible {
+                        token_id: u64::MAX,
+                        to: sender_bytes,
+                        series_id: u32::MAX,
+                        rom,
+                        ram: vec![],
+                    }),
+                })
                 .unwrap(),
             )
         }
@@ -684,9 +698,11 @@ fn carbon_tx_builder_vector(case_id: &str) -> String {
                         receiver_bytes,
                         public_rom,
                         vec![],
-                        Some(FeeOptions::default()),
-                        123,
-                        1_759_711_416_000,
+                        TxLimits {
+                            max_gas: 10_000_000,
+                            max_data: 123,
+                            expiry: 1_759_711_416_000,
+                        },
                     )
                     .unwrap(),
                 )
@@ -708,28 +724,34 @@ fn mint_nft_signing_hex_helper_matches_raw_helper() {
             .public_key(),
     )
     .unwrap();
-    let raw = build_mint_non_fungible_tx_and_sign(
+    let options = PlanAndSignOptions {
+        limits: TxLimits {
+            max_gas: 10_000_000,
+            max_data: 0,
+            expiry: 1_759_711_416_000,
+        },
+        ..PlanAndSignOptions::default()
+    };
+    let raw = build_mint_phantasma_non_fungible_single_tx_and_sign(
         9,
         7,
         &keys,
         receiver,
         vec![0xAA],
         vec![],
-        Some(FeeOptions::default()),
-        0,
-        1_759_711_416_000,
+        None,
+        &options,
     )
     .unwrap();
-    let encoded = build_mint_non_fungible_tx_and_sign_hex(
+    let encoded = build_mint_phantasma_non_fungible_single_tx_and_sign_hex(
         9,
         7,
         &keys,
         receiver,
         vec![0xAA],
         vec![],
-        Some(FeeOptions::default()),
-        0,
-        1_759_711_416_000,
+        None,
+        &options,
     )
     .unwrap();
     assert_eq!(encoded, hex::encode(raw));

@@ -4,11 +4,13 @@
 use std::collections::HashSet;
 
 use crate::carbon::{
-    deserialize, envelope_bytes, is_nft_address, required_witnesses, standard_meta, GasConfig,
-    GovernanceContractMethod, MintPhantasmaNonFungibleArgs, ModuleId, RegisterNameArgs,
-    TokenContractMethod, TokenFlags, TokenInfo, TxMsg, TxMsgCall, TxPayload, VMDynamicStruct,
+    deserialize, envelope_bytes, is_nft_address, required_witnesses,
+    sign_and_serialize_tx_msg_with_keys, standard_meta, GasConfig, GovernanceContractMethod,
+    MintPhantasmaNonFungibleArgs, ModuleId, RegisterNameArgs, TokenContractMethod, TokenFlags,
+    TokenInfo, TxLimits, TxMsg, TxMsgCall, TxPayload, VMDynamicStruct,
 };
-use crate::error::{builder, Result};
+use crate::crypto::PhantasmaKeys;
+use crate::error::{builder, PhantasmaError, Result};
 
 /// Native operations the fee calculator models exactly, plus `Script`, the budget for everything
 /// else.
@@ -1041,9 +1043,7 @@ fn describe_call(
     if call.module_id == ModuleId::Token as u32 {
         if call.method_id == TokenContractMethod::CreateToken as u32 {
             let info: TokenInfo = deserialize(&call.args).map_err(|err| {
-                crate::error::PhantasmaError::Builder(format!(
-                    "plan_fees: CreateToken arguments: {err}"
-                ))
+                PhantasmaError::Builder(format!("plan_fees: CreateToken arguments: {err}"))
             })?;
             // The token-info row is the Call arguments as submitted: the chain stores the TokenInfo
             // it was given, metadata included, and measured bills confirm the row equals the
@@ -1053,9 +1053,7 @@ fn describe_call(
                 VMDynamicStruct::default()
             } else {
                 deserialize::<VMDynamicStruct>(&info.metadata).map_err(|err| {
-                    crate::error::PhantasmaError::Builder(format!(
-                        "plan_fees: CreateToken metadata: {err}"
-                    ))
+                    PhantasmaError::Builder(format!("plan_fees: CreateToken metadata: {err}"))
                 })?
             };
             return Ok((
@@ -1091,7 +1089,7 @@ fn describe_call(
         }
         if call.method_id == TokenContractMethod::MintPhantasmaNonFungible as u32 {
             let args: MintPhantasmaNonFungibleArgs = deserialize(&call.args).map_err(|err| {
-                crate::error::PhantasmaError::Builder(format!(
+                PhantasmaError::Builder(format!(
                     "plan_fees: MintPhantasmaNonFungible arguments: {err}"
                 ))
             })?;
@@ -1134,9 +1132,7 @@ fn describe_call(
         && call.method_id == GovernanceContractMethod::RegisterName as u32
     {
         let args: RegisterNameArgs = deserialize(&call.args).map_err(|err| {
-            crate::error::PhantasmaError::Builder(format!(
-                "plan_fees: RegisterName arguments: {err}"
-            ))
+            PhantasmaError::Builder(format!("plan_fees: RegisterName arguments: {err}"))
         })?;
         return Ok((
             NativeFeeKind::RegisterName,
@@ -1169,6 +1165,48 @@ fn instance_count(len: usize) -> Result<u32> {
 }
 
 fn length_u32(len: usize) -> Result<u32> {
-    u32::try_from(len)
-        .map_err(|_| crate::error::PhantasmaError::Builder("plan_fees: length exceeds u32".into()))
+    u32::try_from(len).map_err(|_| PhantasmaError::Builder("plan_fees: length exceeds u32".into()))
+}
+
+/// The options of the `build_*_tx_and_sign` conveniences: how to plan the fee, or what to write
+/// instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanAndSignOptions {
+    /// The facts the plan cannot read from the message; see [`FeePlanOptions`].
+    pub facts: FeePlanOptions,
+    /// The limits the builder writes into the message. A nonzero `max_gas` fixes the offer and
+    /// skips planning; see [`TxLimits`].
+    pub limits: TxLimits,
+}
+
+/// Plans a freshly built message against `config` - unless the caller fixed `max_gas` themselves -
+/// and signs it with in-memory keys. The convenience behind every `build_*_tx_and_sign` helper; a
+/// wallet with an external signer plans with [`plan_fees`] and signs with
+/// [`crate::sign_tx_msg_with`].
+pub fn plan_and_sign_with_keys(
+    msg: &TxMsg,
+    keys: &[&PhantasmaKeys],
+    config: Option<&GasConfig>,
+    options: &PlanAndSignOptions,
+) -> Result<Vec<u8>> {
+    // Whether the fee is already settled is read from the MESSAGE: the builders are what write the
+    // caller's limits into it, so the message is the one place that is right for every helper. The
+    // same rule as PhantasmaRpc::send_transaction.
+    if msg.max_gas != 0 {
+        return sign_and_serialize_tx_msg_with_keys(msg, keys);
+    }
+    let Some(config) = config else {
+        return builder(
+            "plan_and_sign: a message without a gas offer needs the chain's gas config to plan it: pass the config, or fix max_gas in the limits",
+        );
+    };
+    // Only the witness-array types take their witness count from the caller, and these keys are
+    // that caller's answer; for every other type the message fixes its own slots and one key may
+    // fill two of them, so passing a count would contradict the message.
+    let mut plan_options = options.facts.clone();
+    if required_witnesses(msg).is_none() && plan_options.witness_count.is_none() {
+        plan_options.witness_count = Some(length_u32(keys.len())?);
+    }
+    let plan = plan_fees(msg, config, &plan_options)?;
+    sign_and_serialize_tx_msg_with_keys(&plan.apply(msg), keys)
 }
