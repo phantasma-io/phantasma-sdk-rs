@@ -21,8 +21,8 @@ use serde_json::{json, Value};
 
 use crate::carbon::{
     deserialize, get_nft_address, parse_create_token_result, parse_create_token_series_result,
-    required_witnesses, serialize, sign_and_serialize_tx_msg_with, sign_tx_msg, Bytes32, GasConfig,
-    ModuleId, SignedTxMsg, TokenContractMethod, TokenInfo, TxMsg, TxPayload, TxSigner, TxType,
+    required_witnesses, serialize, sign_and_serialize_tx_msg_with, Bytes32, GasConfig, ModuleId,
+    SignedTxMsg, TokenContractMethod, TokenInfo, TxMsg, TxPayload, TxSigner, TxType,
 };
 use crate::crypto::PhantasmaKeys;
 use crate::encoding::{decode_hex, encode_hex};
@@ -1508,40 +1508,6 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
 
     pub async fn send_signed_tx_msg(&self, tx: &SignedTxMsg) -> Result<String> {
         self.send_carbon_transaction(&serialize(tx)?).await
-    }
-
-    pub fn sign_carbon_transaction(
-        &self,
-        msg: &TxMsg,
-        keys: &PhantasmaKeys,
-    ) -> Result<SignedTxMsg> {
-        sign_tx_msg(msg, keys)
-    }
-
-    pub async fn sign_and_send_carbon_transaction(
-        &self,
-        msg: &TxMsg,
-        keys: &PhantasmaKeys,
-    ) -> Result<String> {
-        self.send_signed_tx_msg(&self.sign_carbon_transaction(msg, keys)?)
-            .await
-    }
-
-    pub async fn build_sign_send_tx_msg(
-        &self,
-        msg: &TxMsg,
-        keys: &PhantasmaKeys,
-    ) -> Result<String> {
-        self.send_signed_tx_msg(&sign_tx_msg(msg, keys)?).await
-    }
-
-    pub async fn send_create_token_tx(
-        &self,
-        msg: &TxMsg,
-        keys: &PhantasmaKeys,
-    ) -> Result<(String, Option<u64>)> {
-        let tx_hash = self.build_sign_send_tx_msg(msg, keys).await?;
-        Ok((tx_hash, None))
     }
 
     /// The gas token's id, which the pre-flight uses as its control lookup: it certainly exists
