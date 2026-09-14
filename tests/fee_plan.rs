@@ -824,6 +824,84 @@ fn names_every_instance_a_message_burns() {
     assert!(burned_instances(&transfer).is_empty());
 }
 
+/// Whether the number a plan carries is a prediction of the settlement or an upper bound on it.
+#[test]
+fn says_whether_the_number_is_a_prediction_or_a_ceiling() {
+    let config = config();
+    let (owner, other) = keys();
+    let from = address_of(&owner);
+    let to = address_of(&other);
+
+    let gas_token = base_tx(
+        TxType::TransferFungible,
+        from,
+        TxPayload::TransferFungible(TxMsgTransferFungible {
+            to,
+            token_id: config.gas_token_id,
+            amount: 1,
+        }),
+    );
+    assert!(
+        plan_fees(&gas_token, &config, &FeePlanOptions::default())
+            .unwrap()
+            .exact,
+        "a gas-token transfer reads no state fact, so its plan is a prediction"
+    );
+
+    let ordinary = base_tx(
+        TxType::TransferFungible,
+        from,
+        TxPayload::TransferFungible(TxMsgTransferFungible {
+            to,
+            token_id: 9,
+            amount: 1,
+        }),
+    );
+    assert!(
+        !plan_fees(&ordinary, &config, &FeePlanOptions::default())
+            .unwrap()
+            .exact,
+        "an unstated recipient row decides the price, so the plan is a ceiling"
+    );
+    assert!(
+        plan_fees(
+            &ordinary,
+            &config,
+            &FeePlanOptions {
+                recipient_holds_token: true,
+                ..FeePlanOptions::default()
+            }
+        )
+        .unwrap()
+        .exact,
+        "with the recipient row stated the plan is a prediction"
+    );
+
+    // A budgeted part makes the whole plan a ceiling, whatever the facts say.
+    let script = base_tx(
+        TxType::Phantasma,
+        from,
+        TxPayload::Phantasma(TxMsgPhantasma {
+            nexus: SmallString::new("main").unwrap(),
+            chain: SmallString::new("main").unwrap(),
+            script: vec![1],
+        }),
+    );
+    assert!(
+        !plan_fees(
+            &script,
+            &config,
+            &FeePlanOptions {
+                witness_count: Some(1),
+                ..FeePlanOptions::default()
+            }
+        )
+        .unwrap()
+        .exact,
+        "a budgeted script is never a prediction"
+    );
+}
+
 /// The one call shape that cannot be priced from the message: its arguments are assembled from the
 /// results of earlier calls, so there is nothing to read them from yet.
 #[test]

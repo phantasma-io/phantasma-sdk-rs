@@ -151,7 +151,7 @@ of the gas and data tokens are free, so for those tokens `recipient_holds_token`
 | `CreateToken` | none | nothing is assumed | the price comes entirely from the message: the symbol length, the serialized `TokenInfo`, and which keys its metadata carries |
 | `CreateTokenSeries` | `series_has_meta_id` | the series metadata carries an `_i` id | 1 quantum |
 | `RegisterName` | none | nothing is assumed | governance rows are free data; the price is the length-shifted policy fee and the envelope |
-| `Script` | none | 5000 work units, 512 event bytes and 4 storage quanta, per unmodelled call | a budget and never a prediction |
+| `Script` | none | 5000 work units, 512 event bytes and 4 storage quanta, per unmodelled call | a budget and never a prediction. `plan.exact` is `false` whenever one is present |
 
 Notes:
 
@@ -159,6 +159,13 @@ Notes:
   priced and then summed, because the chain bills a batch as the sum of its calls with the envelope
   counted once. One kind is a budget and not a formula: `NativeFeeKind::Script`, which covers VM
   scripts and calls the SDK does not model. Their work depends on execution.
+- `plan.exact` says whether the number is a prediction or a ceiling. It is `true` when nothing the
+  plan had to assume could have changed it. It is `false` when a costlier reading decided part of the
+  price, or when a part of the message had to be budgeted. A wallet shows the amount when the flag is
+  `true`, and "up to" in front of the amount when it is `false`. The flag is answered by pricing the
+  message a second time with every fact at its cheaper reading, so it is about THIS message and not
+  about which options you set. A KCAL transfer is exact with nothing stated, because the chain's own
+  token rows are free and `recipient_holds_token` cannot move its price.
 - `burned_instances(&msg)` names the NFT instances a message burns, in any shape. It covers the
   native burn types, a `Token.BurnNonFungible` call, and every such call inside a `CallMulti`. Use it
   to tell whether `infusions` is required. An empty answer means the list is not required.

@@ -949,6 +949,22 @@ pub struct FeePlan {
     ///
     /// This field says what was priced. How firm the number is, [`FeePlan::exact`] answers.
     pub kinds: Vec<NativeFeeKind>,
+    /// True when this bill is a prediction of the settlement, false when it is an upper bound on
+    /// it. A wallet showing a fee reads this one field to choose between "0.0073 KCAL" and "up to
+    /// 0.0073 KCAL".
+    ///
+    /// The field is false in two cases. A chain-state fact was left at its costlier reading and that
+    /// reading decided part of the price. Or some part of the message had to be budgeted.
+    ///
+    /// `recipient_holds_token`, `token_burned_before` and `supply_row_exists` are plain bools whose
+    /// `false` is the costlier reading, so a caller that states the costlier value and a caller that
+    /// states nothing arrive here the same way, and both get a bound. Stating a costlier fact buys
+    /// nothing, so nothing is lost by that.
+    ///
+    /// `big_fungible` is flipped even when the caller stated it. It claims nothing about chain
+    /// state: it asks the model to price the widest answer a variable-length balance can have. A
+    /// plan that rests on it reports false however it was arrived at.
+    pub exact: bool,
     /// The signed size the plan was computed for. These are the bytes the block will carry.
     pub envelope_bytes: u32,
     /// See [`FeeQuote::max_gas`].
@@ -1055,8 +1071,11 @@ pub fn plan_fees(msg: &TxMsg, config: &GasConfig, options: &FeePlanOptions) -> R
     };
     let estimate = estimate_native_fee_batch(&parts, config, transaction)?;
     let kinds: Vec<NativeFeeKind> = parts.iter().map(|part| part.kind).collect();
+    let budgeted = kinds.contains(&NativeFeeKind::Script);
+    let exact = !budgeted && !assumptions_mattered(msg, config, options, transaction, &estimate)?;
     Ok(FeePlan {
         kinds,
+        exact,
         envelope_bytes: transaction.envelope_bytes,
         max_gas: estimate.max_gas,
         max_data: estimate.max_data,
@@ -1064,6 +1083,43 @@ pub fn plan_fees(msg: &TxMsg, config: &GasConfig, options: &FeePlanOptions) -> R
         new_storage_quanta: estimate.new_storage_quanta,
         deleted_storage_quanta: estimate.deleted_storage_quanta,
     })
+}
+
+// Whether a fact left at its costlier reading changed this quote.
+//
+// The message is priced a second time, with every state fact at its CHEAPER reading. The two quotes
+// are then compared. If they agree, the costlier readings decided nothing and the bill is a
+// prediction.
+//
+// The question is asked this way to keep ONE definition of which facts an operation reads: the
+// operation models themselves. A list written here would drift from them as the models change.
+//
+// The answer is also per message, not per kind. That matters. A gas-token transfer does not depend
+// on recipient_holds_token at all, because the chain's own rows are free. A plan that reported the
+// fact as assumed would send every ordinary transfer to the "up to" branch.
+//
+// infusions is not flipped. It has no cheaper reading, and the planner demands it.
+fn assumptions_mattered(
+    msg: &TxMsg,
+    config: &GasConfig,
+    options: &FeePlanOptions,
+    transaction: NativeFeeTransactionParams,
+    quoted: &NativeFeeEstimate,
+) -> Result<bool> {
+    let cheapest = FeePlanOptions {
+        recipient_holds_token: true,
+        token_burned_before: true,
+        supply_row_exists: true,
+        big_fungible: Some(false),
+        rom_has_meta_id: Some(options.rom_has_meta_id.unwrap_or(false)),
+        series_has_meta_id: Some(options.series_has_meta_id.unwrap_or(false)),
+        duplicated_series: Some(options.duplicated_series.unwrap_or(false)),
+        ..options.clone()
+    };
+    let cheaper = estimate_native_fee_batch(&describe(msg, &cheapest)?, config, transaction)?;
+    Ok(cheaper.expected_gas_bill != quoted.expected_gas_bill
+        || cheaper.max_gas != quoted.max_gas
+        || cheaper.max_data != quoted.max_data)
 }
 
 // Recognises the operations a message performs and reads their facts out of the message. An ordinary

@@ -1,6 +1,6 @@
 //! Builds a one-atom transfer of the chain's gas token to the given address and prices it from
 //! the message, without signing or sending anything: the plan is what a wallet shows before asking
-//! for confirmation. Read-only - it costs nothing to run.
+//! for confirmation. It is read-only and costs nothing to run.
 //!
 //! Usage: plan_carbon_transfer_fee [RPC_URL] [RECIPIENT_ADDRESS]
 
@@ -46,10 +46,12 @@ async fn main() -> Result<()> {
         operations.join(", "),
         plan.envelope_bytes
     );
-    println!(
-        "Gas bill: {} KCAL (offer {} KCAL)",
-        summary.gas_bill, summary.gas_offer
-    );
+    let bill = if plan.exact {
+        summary.gas_bill.clone()
+    } else {
+        format!("up to {}", summary.gas_bill)
+    };
+    println!("Gas bill: {bill} KCAL (offer {} KCAL)", summary.gas_offer);
     println!(
         "Storage deposit ceiling: {} SOUL ({} new rows)",
         summary.storage_ceiling, plan.new_storage_quanta
