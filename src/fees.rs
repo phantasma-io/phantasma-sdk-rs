@@ -5,9 +5,11 @@ use std::collections::HashSet;
 
 use crate::carbon::{
     deserialize, envelope_bytes, is_nft_address, required_witnesses,
-    sign_and_serialize_tx_msg_with_keys, standard_meta, GasConfig, GovernanceContractMethod,
-    MintPhantasmaNonFungibleArgs, ModuleId, RegisterNameArgs, TokenContractMethod, TokenFlags,
-    TokenInfo, TxLimits, TxMsg, TxMsgCall, TxPayload, VMDynamicStruct,
+    sign_and_serialize_tx_msg_with_keys, standard_meta, BurnFungibleArgs, BurnNonFungibleArgs,
+    GasConfig, GovernanceContractMethod, MintFungibleArgs, MintPhantasmaNonFungibleArgs, ModuleId,
+    MsgCallArgSections, RegisterNameArgs, TokenContractMethod, TokenFlags, TokenInfo,
+    TransferFungibleArgs, TransferNonFungibleArgs, TxLimits, TxMsg, TxMsgCall, TxPayload,
+    VMDynamicStruct,
 };
 use crate::crypto::PhantasmaKeys;
 use crate::error::{builder, PhantasmaError, Result};
@@ -101,128 +103,154 @@ const DEFAULT_SCRIPT_UNITS_ALLOWANCE: u64 = 5000;
 const DEFAULT_SCRIPT_EVENT_BYTES: u32 = 512;
 const DEFAULT_SCRIPT_STORAGE_QUANTA: u32 = 4;
 
-/// Inputs of [`estimate_native_fee`]. Under gas model v2 every byte the transaction puts in the
-/// block is billed and every new storage row is escrowed, so the inputs are the sizes the chain will
-/// see: the signed envelope, the serialized structures the operation stores, and the facts about
-/// existing state that decide whether a row is new.
+/// Inputs of [`estimate_native_fee`]. Under gas model v2 the chain bills every byte the transaction
+/// puts in the block and escrows every new storage row. The inputs are therefore the sizes the chain
+/// will see: the signed envelope, the serialized structures the operation stores, and the facts
+/// about existing state that decide whether a row is new.
 ///
-/// The inputs are of two kinds, and they are defaulted differently:
+/// The inputs are of two kinds, and they are defaulted differently.
 ///
-/// - Facts the CALLER CANNOT KNOW without reading chain state - whether the recipient already holds
-///   the token, whether a ROM carries an `_i` id, which mode a series mints in. Each defaults to the
-///   case that costs MORE, so an estimate built from `Default::default()` is an upper bound the
-///   settlement can only undercut, never a short offer. The facts whose costlier reading is `true`
-///   are `Option<bool>` with `None` meaning "unstated"; the others are plain bools whose `false` is
-///   the costlier reading.
-/// - Facts carried by the MESSAGE ITSELF - the instance count, the serialized sizes, whether the
-///   token being created is non-fungible or carries `pre_burn`. These have no safe default because
-///   they are not guesses: pass them. `plan_fees` reads every one of them out of the message.
+/// - Facts the CALLER CANNOT KNOW without reading chain state. Examples: whether the recipient
+///   already holds the token, whether a ROM carries an `_i` id, which mode a series mints in. Each
+///   defaults to the case that costs MORE. An estimate built from `Default::default()` is then an
+///   upper bound, and the settlement can only come out below it. The facts whose costlier reading is
+///   `true` are `Option<bool>`, where `None` means unstated. The others are plain bools whose
+///   `false` is the costlier reading.
+/// - Facts carried by the MESSAGE ITSELF. Examples: the instance count, the serialized sizes,
+///   whether the token being created is non-fungible or carries `pre_burn`. These are not guesses,
+///   so they have no safe default. Pass them. `plan_fees` reads every one of them out of the
+///   message.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NativeFeeParams {
-    /// Full signed transaction size in bytes - the envelope carried in the block. Required under gas
-    /// model v2 (see `envelope_bytes` and [`envelope_bytes_for`]); ignored under v1, which billed
-    /// only the payload note.
+    /// Full signed transaction size in bytes. This is the envelope the block carries. Required under
+    /// gas model v2 (see `envelope_bytes` and [`envelope_bytes_for`]). Ignored under v1, which
+    /// billed the payload note alone.
     pub envelope_bytes: u32,
-    /// Instance count for NFT kinds (transferred / minted / burned instances). `None` = 1.
+    /// Instance count for NFT kinds (transferred, minted or burned instances). `None` is 1.
     pub count: Option<u32>,
-    /// Token moved by a transfer / mint / burn. Balance rows of the chain's gas and data tokens are
-    /// free, so with the token id known the estimate escrows nothing for them; `None` prices the
+    /// Token moved by a transfer, mint or burn. Balance rows of the chain's gas and data tokens are
+    /// free, so with the token id known the estimate escrows nothing for them. `None` prices the
     /// rows as paid.
     pub token_id: Option<u64>,
-    /// The recipient already holds this token, so its balance row exists and costs nothing.
-    /// `false` (the default) prices a fresh row.
+    /// The recipient already holds this token, so its balance row exists and costs nothing. `false`,
+    /// the default, prices a fresh row.
     pub recipient_holds_token: bool,
-    /// The recipient is an NFT-derived address (an infusion): the chain reads that NFT's owner - one
-    /// extra query fee. Transfers and every mint kind pay it; a burn has no recipient. This is a fact
-    /// of the recipient's address form, not of chain state - `plan_fees` derives it from the
-    /// message's own recipient (`is_nft_address`) - so only direct callers of this calculator pass it.
+    /// The recipient is an NFT-derived address, which means an infusion. The chain reads that NFT's
+    /// owner, and that costs one extra query fee. Transfers and every mint kind pay it. A burn has
+    /// no recipient.
+    ///
+    /// This is a fact of the recipient's address form. It says nothing about chain state.
+    /// `plan_fees` derives it from the message's own recipient with `is_nft_address`, so only direct
+    /// callers of this calculator pass it.
     pub to_is_nft_address: bool,
-    /// The token's balances can exceed int64 (a big-fungible token). A fungible mint or burn answers
-    /// with the RESULTING balance as a variable-length integer - 9 bytes while it fits int64, up to
-    /// 33 for an int256 balance - and the resulting balance is chain state, so `None` prices the
-    /// 33-byte maximum: a covering bound, refunded down. `Some(false)` prices the 9-byte result
-    /// exactly, for an ordinary int64 token.
+    /// The token's balances can exceed int64. Such a token is called big-fungible.
+    ///
+    /// A fungible mint or burn answers with the RESULTING balance as a variable-length integer. That
+    /// is 9 bytes while the balance fits int64, and up to 33 bytes for an int256 balance. The
+    /// resulting balance is chain state, so `None` prices the 33-byte maximum. The offer then covers
+    /// the bill and the difference is refunded. Pass `Some(false)` for an ordinary int64 token and
+    /// the estimate is exact.
     pub big_fungible: Option<bool>,
-    /// The token has been burned before, so its burnt counter row exists. `false` (the default)
+    /// The token has been burned before, so its burnt counter row exists. `false`, the default,
     /// prices the row the first burn creates.
     pub token_burned_before: bool,
     /// The token's supply-tracking row exists. The chain drops that row when its balance reaches
-    /// exactly zero, so this is chain state with two absent-row edges: a limited-supply token whose
-    /// entire supply is in circulation (the next burn recreates the row) and an unlimited token
-    /// with nothing outstanding (the next mint recreates it). Unstated, every mint and burn prices
-    /// the recreation - one more storage quantum in the bill and the escrow ceiling - so the default
-    /// covers both edges; pass `true` for the exact quote whenever the token is not at one of them.
-    /// Rows of the chain's gas and data tokens are free either way.
+    /// exactly zero, so the row can be absent in two cases. A limited-supply token has its entire
+    /// supply in circulation, and the next burn recreates the row. An unlimited token has nothing
+    /// outstanding, and the next mint recreates it.
+    ///
+    /// While this is `false`, every mint and burn prices the recreation. That is one more storage
+    /// quantum in the bill and in the escrow ceiling, and it covers both cases. Pass `true` for the
+    /// exact quote whenever the token is in neither of them. Rows of the chain's gas and data tokens
+    /// are free either way.
     pub supply_row_exists: bool,
-    /// What the burned NFTs hold at their own addresses (BurnNonFungible), one entry per asset per
-    /// burned instance. The burn returns every one of them to the burner, and the chain charges for
-    /// each: a transfer fee plus the owner-lookup query of the NFT-address source per fungible token,
-    /// an instance query plus a transfer per instance plus that lookup per NFT token, and the
-    /// burner's balance row of a returned token the burner does not hold. This is chain state the
-    /// message does not carry, and it has no costlier bound - an NFT can hold any number of assets -
-    /// so nothing is assumed: `None` prices an empty address (direct callers of this calculator state
-    /// what they know), while `plan_fees` demands the list and the RPC-side planner reads it from
-    /// the chain.
+    /// What the burned NFTs hold at their own addresses (BurnNonFungible). There is one entry per
+    /// asset per burned instance.
+    ///
+    /// The burn returns every one of them to the burner, and the chain charges for each. A fungible
+    /// token costs a transfer fee plus the owner-lookup query of the NFT-address source. An NFT
+    /// token costs an instance query, a transfer per instance, and that same lookup. A returned
+    /// token the burner does not hold also costs the burner's new balance row.
+    ///
+    /// This is chain state that the message does not carry, and an NFT can hold any number of
+    /// assets, so there is no costlier bound to assume. `None` prices an empty address, because a
+    /// direct caller of this calculator states what it knows. `plan_fees` demands the list, and the
+    /// RPC-side planner reads it from the chain.
     pub infusions: Option<Vec<InfusedAsset>>,
-    /// Token symbol length in characters (CreateToken). 0 = no symbol.
+    /// Token symbol length in characters (CreateToken). 0 is no symbol.
     pub symbol_length: u32,
-    /// Serialized `TokenInfo` length (CreateToken) - the Call arguments; it becomes the token-info row.
+    /// Serialized `TokenInfo` length (CreateToken). These are the Call arguments, and they become
+    /// the token-info row.
     pub token_info_bytes: u32,
-    /// The token being created is non-fungible (CreateToken): one more row, the series counter.
+    /// The token being created is non-fungible (CreateToken). It costs one more row, the series
+    /// counter.
     pub non_fungible: bool,
-    /// The token metadata carries `pre_burn` (CreateToken): the burnt counter row is created at once.
+    /// The token metadata carries `pre_burn` (CreateToken). The burnt counter row is then created at
+    /// once.
     pub has_pre_burn: bool,
-    /// The token metadata carries an inflation schedule (CreateToken): the next-inflation row is created.
+    /// The token metadata carries an inflation schedule (CreateToken). The next-inflation row is
+    /// then created.
     pub has_inflation_schedule: bool,
-    /// The token metadata names a staking organisation (CreateToken): the creation looks the
-    /// organisation up, one query fee.
+    /// The token metadata names a staking organisation (CreateToken). The creation looks that
+    /// organisation up, which costs one query fee.
     pub has_staking_organisation: bool,
-    /// The token metadata names a staking reward token (CreateToken): the creation reads that
-    /// token's info, one query fee.
+    /// The token metadata names a staking reward token (CreateToken). The creation reads that
+    /// token's info, which costs one query fee.
     pub has_staking_reward_token: bool,
-    /// Serialized `SeriesInfo` length (CreateTokenSeries) - the Call arguments after the token id.
+    /// Serialized `SeriesInfo` length (CreateTokenSeries). These are the Call arguments after the
+    /// token id.
     pub series_info_bytes: u32,
-    /// The series metadata carries a `_i` id (CreateTokenSeries): the meta-id lookup row is created.
-    /// Schema-encoded like the ROM, so `None` prices the row that may be billed.
+    /// The series metadata carries a `_i` id (CreateTokenSeries). The meta-id lookup row is then
+    /// created. The metadata is schema-encoded like the ROM, so a caller holding only the bytes
+    /// cannot tell. `None` is the reading that pays for the row.
     pub series_has_meta_id: Option<bool>,
     /// Registered name length in characters (RegisterName). Required for that kind.
     pub name_length: u32,
-    /// ROM bytes per minted or burned instance (MintNonFungible / BurnNonFungible: as stored;
-    /// MintPhantasmaNonFungible: the public ROM): one entry per instance, or a single entry that
-    /// applies to every instance. Empty = 0 bytes.
+    /// ROM bytes per minted or burned instance (MintNonFungible and BurnNonFungible: as stored;
+    /// MintPhantasmaNonFungible: the public ROM). It takes one entry per instance, or a single entry
+    /// that applies to every instance. Empty is 0 bytes.
     pub rom_bytes: Vec<u32>,
-    /// RAM bytes per instance, in the same shape as `rom_bytes`. Empty = no RAM row.
+    /// RAM bytes per instance, in the same shape as `rom_bytes`. Empty is no RAM row.
     pub ram_bytes: Vec<u32>,
-    /// The raw ROM carries a `_i` id, which the chain indexes in one more row (MintNonFungible /
-    /// BurnNonFungible). The ROM is schema-encoded, so a caller holding only the bytes cannot tell,
-    /// and `None` assumes the id - on a mint that is the reading which escrows for the row, and on
-    /// a burn it is the reading that mirrors what the mint created. The burn does not PRICE on it
-    /// either way (see [`NativeFeeEstimate::deleted_storage_quanta`]); a Phantasma mint always has
-    /// one and ignores this input.
+    /// The raw ROM carries a `_i` id, and the chain indexes it in one more row (MintNonFungible and
+    /// BurnNonFungible). The ROM is schema-encoded, so a caller holding only the bytes cannot tell.
+    ///
+    /// `None` assumes the id. On a mint that is the reading which escrows for the row. On a burn it
+    /// is the reading that mirrors what the mint created. A burn never prices on this fact either
+    /// way (see [`NativeFeeEstimate::deleted_storage_quanta`]). A Phantasma mint always has such an
+    /// id and ignores this input.
     pub rom_has_meta_id: Option<bool>,
     /// The series mints duplicated NFTs (MintPhantasmaNonFungible). A duplicated series costs one
     /// more query fee per instance than a unique one, plus one per distinct series (see
     /// `distinct_series_count`). A call whose instances mix duplicated and unique series is priced
     /// as if every instance were duplicated.
     ///
-    /// `None` prices the duplicated mode: a series' mode is chain state the message does not carry,
-    /// so the costlier reading is the only safe one - a duplicated mint priced as unique is short by
-    /// exactly those query fees, and the planner offers the bill with no headroom, so it aborts.
-    /// Pass `Some(false)` only when the series is known to be unique - the saving is a few query fees.
+    /// `None` prices the duplicated mode. A series' mode is chain state that the message does not
+    /// carry, so only the costlier reading is safe. A duplicated mint priced as unique is short by
+    /// exactly those query fees, and the planner offers the bill with no headroom, so the
+    /// transaction aborts. Pass `Some(false)` only when the series is known to be unique. The saving
+    /// is a few query fees.
     pub duplicated_series: Option<bool>,
     /// How many distinct series a duplicated Phantasma mint writes into (MintPhantasmaNonFungible
     /// with `duplicated_series`). The chain reads each series' supply once per transaction, not once
-    /// per instance, so this is the count of distinct series ids in the call - never more than
-    /// `count`. `None` = 1. Ignored for a unique series, which does not read the supply at all.
+    /// per instance, so this is the count of distinct series ids in the call. It is never more than
+    /// `count`. `None` is 1. Ignored for a unique series, which does not read the supply at all.
     pub distinct_series_count: Option<u32>,
-    /// User payload bytes attached to the tx (billed under gas model v1 only).
+    /// User payload bytes attached to the transaction. Billed under gas model v1 only.
     pub payload_bytes: u32,
-    /// VM work-unit allowance for the Script kind. `None` = 5000, which exceeds every script seen in
-    /// mainnet history (max 3392 units) with margin.
+    /// VM work-unit allowance for the Script kind. `None` is 5000, which exceeds every script seen
+    /// in mainnet history (max 3392 units) with margin.
+    ///
+    /// In a `CallMulti` the allowance counts once per unmodelled call, because each of them can do
+    /// that much work. A batch of calls the model does not price therefore offers several times what
+    /// it will spend. The difference is refunded, and a caller who knows the calls can bring the
+    /// offer down with this field.
     pub script_units_allowance: Option<u64>,
-    /// Event bytes allowance for the Script kind (Notify payloads count as block data). `None` = 512.
+    /// Event bytes allowance for the Script kind (Notify payloads count as block data). `None` is
+    /// 512, per unmodelled call like `script_units_allowance`.
     pub script_event_bytes: Option<u32>,
-    /// New storage quanta allowance for the Script kind. `None` = 4.
+    /// New storage quanta allowance for the Script kind. `None` is 4, per unmodelled call like
+    /// `script_units_allowance`.
     pub script_storage_quanta: Option<u32>,
 }
 
@@ -255,7 +283,7 @@ pub struct FeeQuote {
     pub max_gas: u64,
     /// The storage-escrow ceiling (`TxMsg::max_data`): every new row priced at the current row price.
     pub max_data: u64,
-    /// The bill the chain formula yields for exactly the provided inputs - exact for every native
+    /// The bill the chain formula yields for exactly the provided inputs. It is exact for every native
     /// operation when the inputs describe the transaction and the state facts are right. For the
     /// Script kind it is the budgeted allowance, not a prediction.
     ///
@@ -282,8 +310,8 @@ pub struct NativeFeeEstimate {
     ///
     /// Informational. It does not enter the bill: `max_data` covers the rows an operation CREATES,
     /// and the block-data term uses the net growth, which an operation that deletes more than it
-    /// creates floors at zero either way. A burn's figure is therefore a lower bound - the stored
-    /// ROM is chain state the message does not carry - and nothing depends on tightening it.
+    /// creates floors at zero either way. A burn's figure is a lower bound, because the stored ROM
+    /// is chain state that the message does not carry. Nothing depends on tightening it.
     pub deleted_storage_quanta: u32,
 }
 
@@ -309,6 +337,24 @@ struct OperationModel {
     deleted_quanta: u32,
 }
 
+/// One operation of a batched message: the kind it is priced as and the inputs it is priced from.
+/// See [`estimate_native_fee_batch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeFeePart {
+    pub kind: NativeFeeKind,
+    pub params: NativeFeeParams,
+}
+
+/// The estimate inputs that belong to the transaction itself. No operation inside it owns them,
+/// because the block carries one envelope however many operations the message performs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeFeeTransactionParams {
+    /// Full signed transaction size. Required under gas model v2.
+    pub envelope_bytes: u32,
+    /// User payload attached to the transaction. Billed under gas model v1 only.
+    pub payload_bytes: u32,
+}
+
 /// The offline fee calculator: the exact gas bill and storage escrow of a native operation under
 /// both gas models (selected by `GasConfig::version`), reproducing the chain's own settlement
 /// arithmetic and the gas each contract path charges. Any change to those formulas ships as a new
@@ -318,40 +364,102 @@ pub fn estimate_native_fee(
     config: &GasConfig,
     params: &NativeFeeParams,
 ) -> Result<NativeFeeEstimate> {
-    let count = params.count.unwrap_or(1);
+    let transaction = NativeFeeTransactionParams {
+        envelope_bytes: params.envelope_bytes,
+        payload_bytes: params.payload_bytes,
+    };
+    estimate_native_fee_batch(
+        &[NativeFeePart {
+            kind,
+            params: params.clone(),
+        }],
+        config,
+        transaction,
+    )
+}
+
+/// The fee of a message that performs SEVERAL operations in one transaction. That message is a
+/// `CallMulti`. The chain runs its calls in a plain loop, with no per-call surcharge and no batch
+/// dispatch cost. It accumulates one gas bill, one result buffer and one change set over the whole
+/// transaction, and it bills the envelope once. A batch therefore costs the sum of its parts over
+/// work, policy fee, result bytes and rows, settled once.
+///
+/// Rows are counted per part. Two parts that create the SAME row count it twice. Two burns of one
+/// token both count its burnt counter, and two transfers into one fresh address both count its
+/// balance row.
+///
+/// Carrying "an earlier part already created it" forward is unsound in the direction that matters. A
+/// burn that empties a supply to exactly zero deletes the supply row again, so a later mint would be
+/// priced short, abort and be billed. Counting twice raises the escrow ceiling alone, and that is
+/// refunded.
+pub fn estimate_native_fee_batch(
+    parts: &[NativeFeePart],
+    config: &GasConfig,
+    transaction: NativeFeeTransactionParams,
+) -> Result<NativeFeeEstimate> {
+    let mut models = Vec::with_capacity(parts.len());
+    for part in parts {
+        models.push(part_model(part, config)?);
+    }
+    settle(&models, config, transaction)
+}
+
+// The model of one operation, with the input check that belongs to every kind. Split out so the
+// single-operation and the batch entry points build their parts the same way.
+fn part_model(part: &NativeFeePart, config: &GasConfig) -> Result<OperationModel> {
+    let count = part.params.count.unwrap_or(1);
     if count == 0 {
         return builder("estimate_native_fee: count must be a positive integer");
     }
-    let v2 = config.has_gas_model_v2();
-    let model = operation_model(kind, config, params, count)?;
-    // Only the net growth of paid storage is block data; deleted rows are refunded, not billed.
-    let net_quanta = model.new_quanta.saturating_sub(model.deleted_quanta);
+    operation_model(part.kind, config, &part.params, count)
+}
 
-    let (expected, max_gas) = if v2 {
-        if params.envelope_bytes == 0 {
+// Turns the operations a transaction performs into its bill, offer and escrow ceiling. One
+// transaction is settled once. The work, policy fees, result bytes and rows add up. The envelope is
+// counted once. The fee scaling and the minimum-bill floor apply to the total. The chain does the
+// same with the counters it accumulates while the transaction runs.
+fn settle(
+    models: &[OperationModel],
+    config: &GasConfig,
+    transaction: NativeFeeTransactionParams,
+) -> Result<NativeFeeEstimate> {
+    let mut total = OperationModel::default();
+    for model in models {
+        total.work_units = total.work_units.saturating_add(model.work_units);
+        total.policy_fee = total.policy_fee.saturating_add(model.policy_fee);
+        total.result_bytes = total.result_bytes.saturating_add(model.result_bytes);
+        total.new_quanta = total.new_quanta.saturating_add(model.new_quanta);
+        total.deleted_quanta = total.deleted_quanta.saturating_add(model.deleted_quanta);
+    }
+    // Only the net growth of paid storage is block data; deleted rows are refunded, not billed.
+    let net_quanta = total.new_quanta.saturating_sub(total.deleted_quanta);
+
+    let (expected, max_gas) = if config.has_gas_model_v2() {
+        if transaction.envelope_bytes == 0 {
             return builder("estimate_native_fee: envelope_bytes is required under gas model v2");
         }
         // v2: bill = mul_shift(work + block_data * 25, mult, shift) + policy_fee, floored at
         // minimum_gas_bill, where block_data = envelope + net storage quanta + Call result bytes.
-        let block_data = u64::from(params.envelope_bytes)
+        let block_data = u64::from(transaction.envelope_bytes)
             + u64::from(net_quanta)
-            + u64::from(model.result_bytes);
+            + u64::from(total.result_bytes);
         let byte_units = block_data.saturating_mul(GAS_MODEL_V2_UNITS_PER_BLOCK_DATA_BYTE);
         let bill = mul_shift(
-            model.work_units.saturating_add(byte_units),
+            total.work_units.saturating_add(byte_units),
             config.fee_multiplier,
             config.fee_shift,
         )
-        .saturating_add(model.policy_fee);
+        .saturating_add(total.policy_fee);
         let expected = bill.max(config.minimum_gas_bill);
         (expected, expected.max(config.minimum_gas_offer))
     } else {
         // v1: bill = (work * mult >> shift) + block_data * gas_fee_per_byte, where block_data =
         // payload + Call result bytes + net storage quanta; no envelope term, no floor. The v1
         // product prices ride the work term (see operation_model).
-        let work = mul_shift(model.work_units, config.fee_multiplier, config.fee_shift);
-        let block_data =
-            u64::from(params.payload_bytes) + u64::from(model.result_bytes) + u64::from(net_quanta);
+        let work = mul_shift(total.work_units, config.fee_multiplier, config.fee_shift);
+        let block_data = u64::from(transaction.payload_bytes)
+            + u64::from(total.result_bytes)
+            + u64::from(net_quanta);
         let expected = work.saturating_add(block_data.saturating_mul(config.gas_fee_per_byte));
         // Offer shape mirrors the node's own test agent: a 2x minimum-offer pad plus a flat 1 KiB
         // block-data allowance on top of the work term.
@@ -366,10 +474,10 @@ pub fn estimate_native_fee(
 
     Ok(NativeFeeEstimate {
         max_gas,
-        max_data: u64::from(model.new_quanta).saturating_mul(config.data_escrow_per_row),
+        max_data: u64::from(total.new_quanta).saturating_mul(config.data_escrow_per_row),
         expected_gas_bill: expected,
-        new_storage_quanta: model.new_quanta,
-        deleted_storage_quanta: model.deleted_quanta,
+        new_storage_quanta: total.new_quanta,
+        deleted_storage_quanta: total.deleted_quanta,
     })
 }
 
@@ -381,9 +489,9 @@ pub fn estimate_native_fee(
 /// 32-byte address plus 64-byte signature entries.
 ///
 /// `witness_count` has no default on purpose. A fee kind does not distinguish a gas-payer message,
-/// which carries two signatures, from the plain form that carries one - both are the same kind - so
-/// a default of one would silently size a two-signature envelope as a one-signature envelope and
-/// under-offer the transaction by 64 bytes.
+/// which carries two signatures, from the plain form that carries one. Both are the same kind. A
+/// default of one would size a two-signature envelope as a one-signature envelope and under-offer
+/// the transaction by 64 bytes.
 pub fn envelope_bytes_for(
     kind: NativeFeeKind,
     serialized_message_length: u32,
@@ -393,7 +501,7 @@ pub fn envelope_bytes_for(
         serialized_message_length + NATIVE_SIGNATURE_BYTES * witness_count
     } else {
         // CreateToken / CreateTokenSeries / MintPhantasmaNonFungible / RegisterName ride
-        // TxType::Call; Script rides TxType::Phantasma - both carry the witness array form.
+        // TxType::Call. Script rides TxType::Phantasma. Both carry the witness array form.
         serialized_message_length + 4 + WITNESS_ARRAY_ENTRY_BYTES * witness_count
     }
 }
@@ -513,7 +621,7 @@ fn operation_model(
             // Per instance: the mint itself, the series lookup by meta id, and the token-info read
             // the series-mode check performs. A duplicated series reads the token info a SECOND
             // time per instance, to pick up the series' shared ROM, and reads that series' supply
-            // once per distinct series in the call - the chain remembers the supply it already
+            // once per distinct series in the call. The chain remembers a supply it already
             // read, so the supply fee does not scale with the instance count the way the other
             // three do.
             let duplicated_series = params.duplicated_series.unwrap_or(true);
@@ -544,7 +652,7 @@ fn operation_model(
             // must be recreated. Each instance's infusion sweep reads the NFT address balances
             // twice, and whatever the sweep finds is returned to the burner and charged as the
             // transfers it takes (see returned_assets). The deleted rows mirror what the mint
-            // created, which is why the meta-id row is counted the same way here - but see
+            // created, which is why the meta-id row is counted the same way here. See
             // `deleted_storage_quanta`: on a burn this total is reported, never billed.
             let rom_has_meta_id = params.rom_has_meta_id.unwrap_or(true);
             let mut deleted = 0;
@@ -669,7 +777,7 @@ fn operation_model(
 }
 
 // Distinct series a duplicated mint touches, defaulting to one. More series than instances is
-// impossible - every series in the call is written into by at least one instance - and catching it
+// impossible, because at least one instance writes into every series in the call. Catching it
 // here turns a caller's bookkeeping slip into an error instead of an over-offer nobody notices.
 fn distinct_series(params: &NativeFeeParams, count: u32) -> Result<u32> {
     let distinct = params.distinct_series_count.unwrap_or(1);
@@ -685,7 +793,7 @@ fn distinct_series(params: &NativeFeeParams, count: u32) -> Result<u32> {
 // fungible token one transfer plus the owner lookup of the NFT-address source; per NFT token one
 // instance query, one transfer per instance and that same lookup. Rows: a balance row of a token
 // the burner does not hold is created (paid unless the token is the gas or data token, which only
-// the id can tell - an unknown id is priced as paid), every returned instance moves its lookup row,
+// the id can tell, so an unknown id is priced as paid), every returned instance moves its lookup row,
 // and the NFT address's own rows are deleted. The deletions always match or exceed the creations,
 // so the returns never add block data; they add work, and rows to the escrow ceiling.
 fn returned_assets(params: &NativeFeeParams, config: &GasConfig) -> Result<OperationModel> {
@@ -779,9 +887,9 @@ fn symbol_shift(length: u32, max_length: u8, param_name: &str) -> Result<u32> {
 /// documents each one, and are not restated here so the two cannot drift apart. The one fact
 /// without a costlier reading is `infusions`: a burned NFT can hold any number of assets, so
 /// [`plan_fees`] demands it instead of assuming, and the RPC-side planner reads it from the chain.
-/// The facts the message itself carries - counts, sizes, token ids, the NFT-address recipient, the
-/// token flags, the metadata keys - are deliberately absent: `plan_fees` reads those out of the
-/// message, and a caller-supplied value could only contradict it.
+/// The facts the message itself carries are absent here: counts, sizes, token ids, the NFT-address
+/// recipient, the token flags, the metadata keys. `plan_fees` reads those out of the message, and a
+/// value from the caller could only contradict it.
 ///
 /// Roughly in order of how likely a caller is to know the answer: an ordinary wallet may well know
 /// `recipient_holds_token`, `big_fungible`, `token_burned_before` and `supply_row_exists`;
@@ -810,8 +918,8 @@ pub struct FeePlanOptions {
     pub rom_has_meta_id: Option<bool>,
     /// See [`NativeFeeParams::series_has_meta_id`].
     pub series_has_meta_id: Option<bool>,
-    /// What a burned NFT holds - required to plan a burn here, read from the chain by
-    /// `PhantasmaRpc::fees`. `Some(vec![])` states that the NFT holds nothing. See
+    /// What the burned NFTs hold. It is required to plan a burn here, and `PhantasmaRpc::fees`
+    /// reads it from the chain. `Some(vec![])` states that the NFTs hold nothing. See
     /// [`NativeFeeParams::infusions`].
     pub infusions: Option<Vec<InfusedAsset>>,
     /// See [`NativeFeeParams::script_units_allowance`].
@@ -822,18 +930,26 @@ pub struct FeePlanOptions {
     pub script_storage_quanta: Option<u32>,
 }
 
-/// A fee plan for one message: the estimate, what it was computed from, and how to apply it.
+/// One NFT instance that a message burns. See [`burned_instances`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BurnedInstance {
+    pub token_id: u64,
+    pub instance_id: u64,
+}
+
+/// A fee plan for one message: the estimate, what it was computed from, and how to apply it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeePlan {
-    /// The operation the message was recognised as, which is also what the bill was computed from.
-    /// Every kind but [`NativeFeeKind::Script`] is priced with the chain's own formula for that
-    /// operation; `Script` covers VM scripts and unmodelled calls, whose work depends on execution
-    /// and can only be budgeted (see `script_units_allowance` and its neighbours).
+    /// The operations the message was recognised as, in call order. The bill was computed from
+    /// them. An ordinary message has one entry, and a `CallMulti` has one entry per inner call.
     ///
-    /// A formula-priced bill is exact for the facts it was given and an upper bound for the ones it
-    /// had to assume: a state fact left unspecified is filled with its costlier default.
-    pub kind: NativeFeeKind,
-    /// The signed size the plan was computed for - the bytes the block will carry.
+    /// Every kind but [`NativeFeeKind::Script`] is priced with the chain's own formula for that
+    /// operation. `Script` covers VM scripts and unmodelled calls. Their work depends on execution,
+    /// so they can only be budgeted (see `script_units_allowance` and its neighbours).
+    ///
+    /// This field says what was priced. How firm the number is, [`FeePlan::exact`] answers.
+    pub kinds: Vec<NativeFeeKind>,
+    /// The signed size the plan was computed for. These are the bytes the block will carry.
     pub envelope_bytes: u32,
     /// See [`FeeQuote::max_gas`].
     pub max_gas: u64,
@@ -867,27 +983,81 @@ impl FeePlan {
     }
 }
 
+/// The NFT instances a message burns. It covers the native burn types, a `Token.BurnNonFungible`
+/// call, and every such call inside a `CallMulti`.
+///
+/// A burn returns whatever the instance's own address holds, and the chain charges for each
+/// returned asset. A planner with a chain to ask reads those assets per instance and hands the union
+/// to [`FeePlanOptions::infusions`].
+///
+/// This function sits beside the decomposition that decides which calls are burns, so the two cannot
+/// come to disagree.
+pub fn burned_instances(msg: &TxMsg) -> Vec<BurnedInstance> {
+    match &msg.msg {
+        TxPayload::BurnNonFungible(inner) => vec![BurnedInstance {
+            token_id: inner.token_id,
+            instance_id: inner.instance_id,
+        }],
+        TxPayload::BurnNonFungibleGasPayer(inner) => vec![BurnedInstance {
+            token_id: inner.token_id,
+            instance_id: inner.instance_id,
+        }],
+        TxPayload::Call(call) => burned_by_call(call),
+        TxPayload::CallMulti(batch) => batch.calls.iter().flat_map(burned_by_call).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn burned_by_call(call: &TxMsgCall) -> Vec<BurnedInstance> {
+    if call
+        .sections
+        .as_ref()
+        .is_some_and(MsgCallArgSections::has_sections)
+    {
+        return Vec::new();
+    }
+    if call.module_id != ModuleId::Token as u32
+        || call.method_id != TokenContractMethod::BurnNonFungible as u32
+    {
+        return Vec::new();
+    }
+    let Ok(args) = deserialize::<BurnNonFungibleArgs>(&call.args) else {
+        return Vec::new();
+    };
+    args.instance_ids
+        .into_iter()
+        .map(|instance_id| BurnedInstance {
+            token_id: args.token_id,
+            instance_id,
+        })
+        .collect()
+}
+
 /// Plans the gas offer and storage ceiling of a message from the message itself: its type and
 /// contents decide the operation model, its signed size is computed with placeholder witnesses, and
-/// the chain config supplies the prices. Pure - fetch the config with `PhantasmaRpc::fees` or
-/// `get_gas_config` and pass it in.
+/// the chain config supplies the prices. It touches no network: fetch the config with
+/// `PhantasmaRpc::fees` or `get_gas_config` and pass it in.
 pub fn plan_fees(msg: &TxMsg, config: &GasConfig, options: &FeePlanOptions) -> Result<FeePlan> {
     // A witness-array message does not say how many signatures it will carry, and each one is 96
-    // billed bytes. Assuming a single witness would under-offer every multi-party transaction by 96
-    // bytes each and get it rejected, so the count is demanded rather than guessed - the same
-    // stance estimate_native_fee takes on a missing envelope size.
+    // billed bytes. An assumed single witness would under-offer every multi-party transaction by 96
+    // bytes per extra signature, and the chain would reject it. So the count is demanded here.
+    // estimate_native_fee takes the same stance on a missing envelope size.
     if required_witnesses(msg).is_none() && options.witness_count.is_none() {
         return builder(format!(
             "plan_fees: {:?} transactions choose their own witnesses: set witness_count to plan one",
             msg.tx_type
         ));
     }
-    let (kind, mut params) = describe(msg, options)?;
-    params.envelope_bytes = envelope_bytes(msg, options.witness_count)?;
-    let estimate = estimate_native_fee(kind, config, &params)?;
+    let parts = describe(msg, options)?;
+    let transaction = NativeFeeTransactionParams {
+        envelope_bytes: envelope_bytes(msg, options.witness_count)?,
+        payload_bytes: 0,
+    };
+    let estimate = estimate_native_fee_batch(&parts, config, transaction)?;
+    let kinds: Vec<NativeFeeKind> = parts.iter().map(|part| part.kind).collect();
     Ok(FeePlan {
-        kind,
-        envelope_bytes: params.envelope_bytes,
+        kinds,
+        envelope_bytes: transaction.envelope_bytes,
         max_gas: estimate.max_gas,
         max_data: estimate.max_data,
         expected_gas_bill: estimate.expected_gas_bill,
@@ -896,10 +1066,13 @@ pub fn plan_fees(msg: &TxMsg, config: &GasConfig, options: &FeePlanOptions) -> R
     })
 }
 
-// Recognises the operation a message performs and reads its facts out of the message. Whether the
-// recipient is an NFT-derived address is NOT taken from the options: the address form decides it,
-// and the message carries the address, so each branch reads it out.
-fn describe(msg: &TxMsg, options: &FeePlanOptions) -> Result<(NativeFeeKind, NativeFeeParams)> {
+// Recognises the operations a message performs and reads their facts out of the message. An ordinary
+// message gives one part, and a CallMulti gives one part per inner call. That is what lets a batch be
+// priced.
+//
+// Whether the recipient is an NFT-derived address is NOT taken from the options: the address form
+// decides it, and the message carries the address, so each branch reads it out.
+fn describe(msg: &TxMsg, options: &FeePlanOptions) -> Result<Vec<NativeFeePart>> {
     // Passed through as they are: the calculator owns every default, so no default is decided in
     // two places.
     let state = NativeFeeParams {
@@ -910,8 +1083,9 @@ fn describe(msg: &TxMsg, options: &FeePlanOptions) -> Result<(NativeFeeKind, Nat
         rom_has_meta_id: options.rom_has_meta_id,
         ..NativeFeeParams::default()
     };
-    Ok(match &msg.msg {
-        TxPayload::TransferFungible(inner) => (
+    let one = |kind, params| Ok(vec![NativeFeePart { kind, params }]);
+    match &msg.msg {
+        TxPayload::TransferFungible(inner) => one(
             NativeFeeKind::TransferFungible,
             NativeFeeParams {
                 token_id: Some(inner.token_id),
@@ -919,7 +1093,7 @@ fn describe(msg: &TxMsg, options: &FeePlanOptions) -> Result<(NativeFeeKind, Nat
                 ..state
             },
         ),
-        TxPayload::TransferFungibleGasPayer(inner) => (
+        TxPayload::TransferFungibleGasPayer(inner) => one(
             NativeFeeKind::TransferFungible,
             NativeFeeParams {
                 token_id: Some(inner.token_id),
@@ -927,7 +1101,7 @@ fn describe(msg: &TxMsg, options: &FeePlanOptions) -> Result<(NativeFeeKind, Nat
                 ..state
             },
         ),
-        TxPayload::TransferNonFungibleSingle(inner) => (
+        TxPayload::TransferNonFungibleSingle(inner) => one(
             NativeFeeKind::TransferNonFungible,
             NativeFeeParams {
                 token_id: Some(inner.token_id),
@@ -936,7 +1110,7 @@ fn describe(msg: &TxMsg, options: &FeePlanOptions) -> Result<(NativeFeeKind, Nat
                 ..state
             },
         ),
-        TxPayload::TransferNonFungibleSingleGasPayer(inner) => (
+        TxPayload::TransferNonFungibleSingleGasPayer(inner) => one(
             NativeFeeKind::TransferNonFungible,
             NativeFeeParams {
                 token_id: Some(inner.token_id),
@@ -945,7 +1119,7 @@ fn describe(msg: &TxMsg, options: &FeePlanOptions) -> Result<(NativeFeeKind, Nat
                 ..state
             },
         ),
-        TxPayload::TransferNonFungibleMulti(inner) => (
+        TxPayload::TransferNonFungibleMulti(inner) => one(
             NativeFeeKind::TransferNonFungible,
             NativeFeeParams {
                 token_id: Some(inner.token_id),
@@ -954,7 +1128,7 @@ fn describe(msg: &TxMsg, options: &FeePlanOptions) -> Result<(NativeFeeKind, Nat
                 ..state
             },
         ),
-        TxPayload::TransferNonFungibleMultiGasPayer(inner) => (
+        TxPayload::TransferNonFungibleMultiGasPayer(inner) => one(
             NativeFeeKind::TransferNonFungible,
             NativeFeeParams {
                 token_id: Some(inner.token_id),
@@ -963,7 +1137,7 @@ fn describe(msg: &TxMsg, options: &FeePlanOptions) -> Result<(NativeFeeKind, Nat
                 ..state
             },
         ),
-        TxPayload::MintFungible(inner) => (
+        TxPayload::MintFungible(inner) => one(
             NativeFeeKind::MintFungible,
             NativeFeeParams {
                 token_id: Some(inner.token_id),
@@ -971,21 +1145,21 @@ fn describe(msg: &TxMsg, options: &FeePlanOptions) -> Result<(NativeFeeKind, Nat
                 ..state
             },
         ),
-        TxPayload::BurnFungible(inner) => (
+        TxPayload::BurnFungible(inner) => one(
             NativeFeeKind::BurnFungible,
             NativeFeeParams {
                 token_id: Some(inner.token_id),
                 ..state
             },
         ),
-        TxPayload::BurnFungibleGasPayer(inner) => (
+        TxPayload::BurnFungibleGasPayer(inner) => one(
             NativeFeeKind::BurnFungible,
             NativeFeeParams {
                 token_id: Some(inner.token_id),
                 ..state
             },
         ),
-        TxPayload::MintNonFungible(inner) => (
+        TxPayload::MintNonFungible(inner) => one(
             NativeFeeKind::MintNonFungible,
             NativeFeeParams {
                 token_id: Some(inner.token_id),
@@ -995,53 +1169,158 @@ fn describe(msg: &TxMsg, options: &FeePlanOptions) -> Result<(NativeFeeKind, Nat
                 ..state
             },
         ),
-        TxPayload::BurnNonFungible(inner) => describe_burn(inner.token_id, state, options)?,
-        TxPayload::BurnNonFungibleGasPayer(inner) => describe_burn(inner.token_id, state, options)?,
-        TxPayload::Call(call) => describe_call(call, state, options)?,
-        TxPayload::CallMulti(_) | TxPayload::Trade(_) | TxPayload::Phantasma(_) => {
-            script_plan(options)
+        TxPayload::BurnNonFungible(inner) => Ok(vec![describe_burn(
+            inner.token_id,
+            1,
+            &state,
+            options.infusions.as_deref(),
+        )?]),
+        TxPayload::BurnNonFungibleGasPayer(inner) => Ok(vec![describe_burn(
+            inner.token_id,
+            1,
+            &state,
+            options.infusions.as_deref(),
+        )?]),
+        TxPayload::Call(call) => Ok(vec![describe_call(
+            call,
+            &state,
+            options,
+            options.infusions.as_deref(),
+        )?]),
+        TxPayload::CallMulti(batch) => {
+            // The chain runs the calls in a loop and bills their sum, so the plan is the sum of
+            // their models. infusions covers every burn in the batch. The returns cost the same
+            // wherever they are counted, so the first burn takes the whole list and the burns after
+            // it take none.
+            let mut parts = Vec::with_capacity(batch.calls.len());
+            let mut returns = options.infusions.as_deref();
+            for call in &batch.calls {
+                let part = describe_call(call, &state, options, returns)?;
+                if part.kind == NativeFeeKind::BurnNonFungible {
+                    returns = Some(&[]);
+                }
+                parts.push(part);
+            }
+            Ok(parts)
         }
-        TxPayload::PhantasmaRaw(_) => {
-            return builder(format!(
-                "plan_fees: cannot plan fees for a {:?} transaction",
-                msg.tx_type
-            ))
-        }
-    })
+        TxPayload::Trade(_) | TxPayload::Phantasma(_) => Ok(vec![script_part(options)]),
+        TxPayload::PhantasmaRaw(_) => builder(format!(
+            "plan_fees: cannot plan fees for a {:?} transaction",
+            msg.tx_type
+        )),
+    }
 }
 
-// Prices an NFT burn. What the NFT holds is chain state with no costlier bound, so it is demanded,
-// not assumed: a burn planned as if the address were empty is short by every returned asset and
+// Prices an NFT burn. What the NFTs hold is chain state with no costlier bound, so it is demanded,
+// not assumed: a burn planned as if the addresses were empty is short by every returned asset and
 // aborts, billed, on every retry. The stored ROM is chain state the message does not carry, so the
-// deleted quanta are a lower bound; that does not touch the offer - a burn deletes more than it
-// creates, and only the rows it creates are escrowed.
+// deleted quanta are a lower bound. That does not touch the offer, because a burn deletes more rows
+// than it creates and only the rows it creates are escrowed.
 fn describe_burn(
     token_id: u64,
-    state: NativeFeeParams,
-    options: &FeePlanOptions,
-) -> Result<(NativeFeeKind, NativeFeeParams)> {
-    let Some(infusions) = &options.infusions else {
+    count: u32,
+    state: &NativeFeeParams,
+    infusions: Option<&[InfusedAsset]>,
+) -> Result<NativeFeePart> {
+    let Some(infusions) = infusions else {
         return builder(
             "plan_fees: a burn returns whatever the NFT holds: set infusions (empty when it holds nothing) or plan through PhantasmaRpc::fees, which reads them from the chain",
         );
     };
-    Ok((
-        NativeFeeKind::BurnNonFungible,
-        NativeFeeParams {
+    Ok(NativeFeePart {
+        kind: NativeFeeKind::BurnNonFungible,
+        params: NativeFeeParams {
             token_id: Some(token_id),
-            count: Some(1),
-            infusions: Some(infusions.clone()),
-            ..state
+            count: Some(count),
+            infusions: Some(infusions.to_vec()),
+            ..state.clone()
         },
-    ))
+    })
 }
 
 fn describe_call(
     call: &TxMsgCall,
-    state: NativeFeeParams,
+    state: &NativeFeeParams,
     options: &FeePlanOptions,
-) -> Result<(NativeFeeKind, NativeFeeParams)> {
+    infusions: Option<&[InfusedAsset]>,
+) -> Result<NativeFeePart> {
+    // A call can build its arguments at execution time from the results of earlier calls. Such a
+    // call carries none of them yet. There is nothing to read a price from, so it takes the script
+    // budget.
+    if call
+        .sections
+        .as_ref()
+        .is_some_and(MsgCallArgSections::has_sections)
+    {
+        return Ok(script_part(options));
+    }
     if call.module_id == ModuleId::Token as u32 {
+        // The five token movements below cost exactly what they cost as native transaction types.
+        // Both paths enter the same contract method. They arrive as module calls because a wallet
+        // batched them.
+        //
+        // TokenContractMethod::MintNonFungible is absent on purpose. The chain refuses it where
+        // governance has not allowed caller-supplied ROM ids, whichever way it arrives, so there is
+        // nothing to price.
+        if call.method_id == TokenContractMethod::TransferFungible as u32 {
+            let args: TransferFungibleArgs = deserialize(&call.args).map_err(|err| {
+                PhantasmaError::Builder(format!("plan_fees: TransferFungible arguments: {err}"))
+            })?;
+            return Ok(NativeFeePart {
+                kind: NativeFeeKind::TransferFungible,
+                params: NativeFeeParams {
+                    token_id: Some(args.token_id),
+                    to_is_nft_address: is_nft_address(&args.to),
+                    ..state.clone()
+                },
+            });
+        }
+        if call.method_id == TokenContractMethod::TransferNonFungible as u32 {
+            let args: TransferNonFungibleArgs = deserialize(&call.args).map_err(|err| {
+                PhantasmaError::Builder(format!("plan_fees: TransferNonFungible arguments: {err}"))
+            })?;
+            return Ok(NativeFeePart {
+                kind: NativeFeeKind::TransferNonFungible,
+                params: NativeFeeParams {
+                    token_id: Some(args.token_id),
+                    count: Some(instance_count(args.instance_ids.len())?),
+                    to_is_nft_address: is_nft_address(&args.to),
+                    ..state.clone()
+                },
+            });
+        }
+        if call.method_id == TokenContractMethod::MintFungible as u32 {
+            let args: MintFungibleArgs = deserialize(&call.args).map_err(|err| {
+                PhantasmaError::Builder(format!("plan_fees: MintFungible arguments: {err}"))
+            })?;
+            return Ok(NativeFeePart {
+                kind: NativeFeeKind::MintFungible,
+                params: NativeFeeParams {
+                    token_id: Some(args.token_id),
+                    to_is_nft_address: is_nft_address(&args.to),
+                    ..state.clone()
+                },
+            });
+        }
+        if call.method_id == TokenContractMethod::BurnFungible as u32 {
+            let args: BurnFungibleArgs = deserialize(&call.args).map_err(|err| {
+                PhantasmaError::Builder(format!("plan_fees: BurnFungible arguments: {err}"))
+            })?;
+            return Ok(NativeFeePart {
+                kind: NativeFeeKind::BurnFungible,
+                params: NativeFeeParams {
+                    token_id: Some(args.token_id),
+                    ..state.clone()
+                },
+            });
+        }
+        if call.method_id == TokenContractMethod::BurnNonFungible as u32 {
+            let args: BurnNonFungibleArgs = deserialize(&call.args).map_err(|err| {
+                PhantasmaError::Builder(format!("plan_fees: BurnNonFungible arguments: {err}"))
+            })?;
+            let count = instance_count(args.instance_ids.len())?;
+            return describe_burn(args.token_id, count, state, infusions);
+        }
         if call.method_id == TokenContractMethod::CreateToken as u32 {
             let info: TokenInfo = deserialize(&call.args).map_err(|err| {
                 PhantasmaError::Builder(format!("plan_fees: CreateToken arguments: {err}"))
@@ -1057,9 +1336,9 @@ fn describe_call(
                     PhantasmaError::Builder(format!("plan_fees: CreateToken metadata: {err}"))
                 })?
             };
-            return Ok((
-                NativeFeeKind::CreateToken,
-                NativeFeeParams {
+            return Ok(NativeFeePart {
+                kind: NativeFeeKind::CreateToken,
+                params: NativeFeeParams {
                     symbol_length: length_u32(info.symbol.0.len())?,
                     token_info_bytes: length_u32(call.args.len())?,
                     non_fungible: info.flags.contains(TokenFlags::NON_FUNGIBLE),
@@ -1075,18 +1354,18 @@ fn describe_call(
                         .is_some(),
                     ..NativeFeeParams::default()
                 },
-            ));
+            });
         }
         if call.method_id == TokenContractMethod::CreateTokenSeries as u32 {
             // The arguments are the u64 token id followed by the SeriesInfo, which becomes the row.
-            return Ok((
-                NativeFeeKind::CreateTokenSeries,
-                NativeFeeParams {
+            return Ok(NativeFeePart {
+                kind: NativeFeeKind::CreateTokenSeries,
+                params: NativeFeeParams {
                     series_info_bytes: length_u32(call.args.len().saturating_sub(8))?,
                     series_has_meta_id: options.series_has_meta_id,
                     ..NativeFeeParams::default()
                 },
-            ));
+            });
         }
         if call.method_id == TokenContractMethod::MintPhantasmaNonFungible as u32 {
             let args: MintPhantasmaNonFungibleArgs = deserialize(&call.args).map_err(|err| {
@@ -1095,9 +1374,9 @@ fn describe_call(
                 ))
             })?;
             let count = instance_count(args.tokens.len())?;
-            // Each instance names the series it is minted into, so the number of distinct series a
-            // duplicated mint touches - which is what the chain's per-series supply read costs
-            // follow - is readable from the call and never has to be supplied by the caller.
+            // Each instance names the series it is minted into. The number of distinct series a
+            // duplicated mint touches is therefore readable from the call, and the caller never has
+            // to supply it. The chain's per-series supply reads are charged per distinct series.
             let series: HashSet<_> = args
                 .tokens
                 .iter()
@@ -1113,9 +1392,9 @@ fn describe_call(
                 .iter()
                 .map(|token| length_u32(token.ram.len()))
                 .collect::<Result<Vec<_>>>()?;
-            return Ok((
-                NativeFeeKind::MintPhantasmaNonFungible,
-                NativeFeeParams {
+            return Ok(NativeFeePart {
+                kind: NativeFeeKind::MintPhantasmaNonFungible,
+                params: NativeFeeParams {
                     token_id: Some(args.token_id),
                     count: Some(count),
                     rom_bytes,
@@ -1123,11 +1402,11 @@ fn describe_call(
                     duplicated_series: options.duplicated_series,
                     distinct_series_count: Some(length_u32(series.len())?),
                     to_is_nft_address: is_nft_address(&args.address),
-                    ..state
+                    ..state.clone()
                 },
-            ));
+            });
         }
-        return Ok(script_plan(options));
+        return Ok(script_part(options));
     }
     if call.module_id == ModuleId::Governance as u32
         && call.method_id == GovernanceContractMethod::RegisterName as u32
@@ -1135,27 +1414,27 @@ fn describe_call(
         let args: RegisterNameArgs = deserialize(&call.args).map_err(|err| {
             PhantasmaError::Builder(format!("plan_fees: RegisterName arguments: {err}"))
         })?;
-        return Ok((
-            NativeFeeKind::RegisterName,
-            NativeFeeParams {
+        return Ok(NativeFeePart {
+            kind: NativeFeeKind::RegisterName,
+            params: NativeFeeParams {
                 name_length: length_u32(args.name.0.len())?,
                 ..NativeFeeParams::default()
             },
-        ));
+        });
     }
-    Ok(script_plan(options))
+    Ok(script_part(options))
 }
 
-fn script_plan(options: &FeePlanOptions) -> (NativeFeeKind, NativeFeeParams) {
-    (
-        NativeFeeKind::Script,
-        NativeFeeParams {
+fn script_part(options: &FeePlanOptions) -> NativeFeePart {
+    NativeFeePart {
+        kind: NativeFeeKind::Script,
+        params: NativeFeeParams {
             script_units_allowance: options.script_units_allowance,
             script_event_bytes: options.script_event_bytes,
             script_storage_quanta: options.script_storage_quanta,
             ..NativeFeeParams::default()
         },
-    )
+    }
 }
 
 fn instance_count(len: usize) -> Result<u32> {
@@ -1180,7 +1459,7 @@ pub struct PlanAndSignOptions {
     pub limits: TxLimits,
 }
 
-/// Plans a freshly built message against `config` - unless the caller fixed `max_gas` themselves -
+/// Plans a freshly built message against `config`, unless the caller fixed `max_gas` themselves,
 /// and signs it with in-memory keys. The convenience behind every `build_*_tx_and_sign` helper; a
 /// wallet with an external signer plans with [`plan_fees`] and signs with
 /// [`crate::sign_tx_msg_with`].

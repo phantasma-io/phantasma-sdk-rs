@@ -4,14 +4,22 @@
 use phantasma_sdk::{
     build_and_serialize_token_schemas, build_create_token_series_tx, build_create_token_tx,
     build_mint_phantasma_non_fungible_tx, build_series_info, build_token_info,
-    build_token_metadata, bytes32_from_public_key, deserialize, envelope_bytes,
+    build_token_metadata, burned_instances, bytes32_from_public_key, deserialize, envelope_bytes,
     estimate_native_fee, get_nft_address, is_nft_address, plan_fees, serialize, unpack_nft_address,
-    Bytes32, FeePlanOptions, GasConfig, GovernanceContractMethod, InfusedAsset, IntX, ModuleId,
-    NativeFeeKind, NativeFeeParams, PhantasmaKeys, PhantasmaNFTMintInfo, RegisterNameArgs,
-    SmallString, TxLimits, TxMsg, TxMsgBurnNonFungible, TxMsgCall, TxMsgCallMulti,
-    TxMsgMintNonFungible, TxMsgTransferFungible, TxMsgTransferFungibleGasPayer,
-    TxMsgTransferNonFungibleMulti, TxPayload, TxType,
+    BurnFungibleArgs, BurnNonFungibleArgs, BurnedInstance, Bytes32, CallArgSection, FeePlan,
+    FeePlanOptions, GasConfig, GovernanceContractMethod, InfusedAsset, IntX, ModuleId,
+    MsgCallArgSections, NativeFeeKind, NativeFeeParams, PhantasmaKeys, PhantasmaNFTMintInfo,
+    RegisterNameArgs, SmallString, TokenContractMethod, TxLimits, TxMsg, TxMsgBurnNonFungible,
+    TxMsgCall, TxMsgCallMulti, TxMsgMintNonFungible, TxMsgPhantasma, TxMsgTransferFungible,
+    TxMsgTransferFungibleGasPayer, TxMsgTransferNonFungibleMulti, TxPayload, TxType,
 };
+
+/// The single operation a plan priced. A plan that priced none or several is a test that asked the
+/// wrong question, so it panics here rather than further down.
+fn only_kind(plan: &FeePlan) -> NativeFeeKind {
+    assert_eq!(plan.kinds.len(), 1, "expected one priced operation");
+    plan.kinds[0]
+}
 
 const ICON: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==";
 
@@ -133,7 +141,7 @@ fn plans_a_native_transfer_from_the_message() {
     let (_, receiver) = keys();
     let msg = transfer(address_of(&receiver), 1);
     let plan = plan_fees(&msg, &config(), &FeePlanOptions::default()).unwrap();
-    assert_eq!(plan.kind, NativeFeeKind::TransferFungible);
+    assert_eq!(only_kind(&plan), NativeFeeKind::TransferFungible);
     assert_eq!(plan.envelope_bytes, envelope_bytes(&msg, None).unwrap());
     assert_eq!(plan.envelope_bytes, 170);
     assert_eq!(plan.expected_gas_bill, 42_600_000);
@@ -256,7 +264,7 @@ fn reads_a_token_creation_out_of_its_call() {
         panic!("expected a call");
     };
     let plan = plan_fees(&fungible, &config(), &options).unwrap();
-    assert_eq!(plan.kind, NativeFeeKind::CreateToken);
+    assert_eq!(only_kind(&plan), NativeFeeKind::CreateToken);
     let direct = estimate_native_fee(
         NativeFeeKind::CreateToken,
         &config(),
@@ -337,7 +345,7 @@ fn reads_a_series_creation_out_of_its_call() {
         ..FeePlanOptions::default()
     };
     let plan = plan_fees(&msg, &config(), &options).unwrap();
-    assert_eq!(plan.kind, NativeFeeKind::CreateTokenSeries);
+    assert_eq!(only_kind(&plan), NativeFeeKind::CreateTokenSeries);
     let direct = estimate_native_fee(
         NativeFeeKind::CreateTokenSeries,
         &config(),
@@ -370,7 +378,10 @@ fn reads_a_phantasma_mint_out_of_its_call() {
         &options,
     )
     .unwrap();
-    assert_eq!(one_series.kind, NativeFeeKind::MintPhantasmaNonFungible);
+    assert_eq!(
+        only_kind(&one_series),
+        NativeFeeKind::MintPhantasmaNonFungible
+    );
     let three_series = plan_fees(
         &phantasma_mint(&[5, 6, 7], 75, address_of(&receiver)),
         &config(),
@@ -430,7 +441,7 @@ fn reads_a_native_nft_mint_out_of_the_message() {
         }),
     );
     let plan = plan_fees(&msg, &config(), &FeePlanOptions::default()).unwrap();
-    assert_eq!(plan.kind, NativeFeeKind::MintNonFungible);
+    assert_eq!(only_kind(&plan), NativeFeeKind::MintNonFungible);
     let direct = estimate_native_fee(
         NativeFeeKind::MintNonFungible,
         &config(),
@@ -463,7 +474,7 @@ fn counts_the_instances_of_a_multi_transfer() {
         )
     };
     let plan = plan_fees(&multi(vec![1, 2]), &config(), &FeePlanOptions::default()).unwrap();
-    assert_eq!(plan.kind, NativeFeeKind::TransferNonFungible);
+    assert_eq!(only_kind(&plan), NativeFeeKind::TransferNonFungible);
     assert_eq!(plan.deleted_storage_quanta, 2);
     assert_eq!(plan.new_storage_quanta, 3);
     let err = plan_fees(&multi(vec![]), &config(), &FeePlanOptions::default()).unwrap_err();
@@ -494,7 +505,7 @@ fn demands_what_a_burned_nft_holds() {
         },
     )
     .unwrap();
-    assert_eq!(empty.kind, NativeFeeKind::BurnNonFungible);
+    assert_eq!(only_kind(&empty), NativeFeeKind::BurnNonFungible);
     let infused = plan_fees(
         &msg,
         &config(),
@@ -554,20 +565,25 @@ fn budgets_unmodelled_calls_as_scripts_and_refuses_raw_transactions() {
         ..FeePlanOptions::default()
     };
     let plan = plan_fees(&unknown, &config(), &options).unwrap();
-    assert_eq!(plan.kind, NativeFeeKind::Script);
+    assert_eq!(only_kind(&plan), NativeFeeKind::Script);
     assert_eq!(
         plan.expected_gas_bill,
         (5000 + u64::from(plan.envelope_bytes + 512) * 25) * 10_000
     );
+    // A batch with no calls performs no operation, so nothing is priced and the bill is the
+    // envelope alone. The same reading of an empty call array is what burned_instances takes.
     let multi = base_tx(
         TxType::CallMulti,
         address_of(&owner),
         TxPayload::CallMulti(TxMsgCallMulti { calls: vec![] }),
     );
+    let empty = plan_fees(&multi, &config(), &options).unwrap();
+    assert!(empty.kinds.is_empty());
     assert_eq!(
-        plan_fees(&multi, &config(), &options).unwrap().kind,
-        NativeFeeKind::Script
+        empty.expected_gas_bill,
+        u64::from(empty.envelope_bytes) * 25 * 10_000
     );
+    assert!(burned_instances(&multi).is_empty());
 }
 
 // RegisterName is a governance call whose arguments the plan reads for the name length.
@@ -599,7 +615,7 @@ fn reads_a_name_registration_out_of_its_call() {
         },
     )
     .unwrap();
-    assert_eq!(plan.kind, NativeFeeKind::RegisterName);
+    assert_eq!(only_kind(&plan), NativeFeeKind::RegisterName);
     let direct = estimate_native_fee(
         NativeFeeKind::RegisterName,
         &config(),
@@ -624,4 +640,223 @@ fn recognises_nft_addresses_by_their_form() {
     let (owner, _) = keys();
     assert!(!is_nft_address(&address_of(&owner)));
     assert!(!is_nft_address(&Bytes32::default()));
+}
+
+fn burn_call(owner: Bytes32, token_id: u64, instance_ids: Vec<u64>) -> TxMsgCall {
+    TxMsgCall {
+        module_id: ModuleId::Token as u32,
+        method_id: TokenContractMethod::BurnNonFungible as u32,
+        args: serialize(&BurnNonFungibleArgs {
+            token_id,
+            from_address: owner,
+            instance_ids,
+        })
+        .unwrap(),
+        sections: None,
+    }
+}
+
+fn burn_fungible_call(owner: Bytes32) -> TxMsgCall {
+    TxMsgCall {
+        module_id: ModuleId::Token as u32,
+        method_id: TokenContractMethod::BurnFungible as u32,
+        args: serialize(&BurnFungibleArgs {
+            token_id: 9,
+            from_address: owner,
+            amount: IntX::from(1i64),
+        })
+        .unwrap(),
+        sections: None,
+    }
+}
+
+/// The batch model: the chain runs a CallMulti as a loop over one VM environment and one result
+/// buffer, so the bill is the sum of the parts with the envelope counted once, and never a flat
+/// script budget.
+#[test]
+fn prices_a_batch_as_the_sum_of_its_calls_with_one_envelope() {
+    let config = config();
+    let (owner, _) = keys();
+    let from = address_of(&owner);
+    let options = FeePlanOptions {
+        witness_count: Some(1),
+        infusions: Some(Vec::new()),
+        ..FeePlanOptions::default()
+    };
+    let single = base_tx(
+        TxType::Call,
+        from,
+        TxPayload::Call(burn_call(from, 9, vec![1])),
+    );
+    let batch = base_tx(
+        TxType::CallMulti,
+        from,
+        TxPayload::CallMulti(TxMsgCallMulti {
+            calls: vec![burn_call(from, 9, vec![1]), burn_call(from, 9, vec![2])],
+        }),
+    );
+    let one = plan_fees(&single, &config, &options).unwrap();
+    let two = plan_fees(&batch, &config, &options).unwrap();
+    assert_eq!(
+        two.kinds,
+        vec![
+            NativeFeeKind::BurnNonFungible,
+            NativeFeeKind::BurnNonFungible
+        ]
+    );
+    // Each burn charges one transfer and two queries, which is 30 work units at these prices. The
+    // rest of the difference is the envelope, which grows by the second call and is billed once.
+    let envelope_growth = u64::from(two.envelope_bytes - one.envelope_bytes);
+    assert_eq!(
+        two.expected_gas_bill,
+        one.expected_gas_bill + (30 + 25 * envelope_growth) * 10_000
+    );
+}
+
+/// Where the infusions of a batch are counted. The returns cost the same wherever they sit, so the
+/// first burn takes the whole list and the burns after it take none; counting them per burn would
+/// multiply the return of one NFT by the batch size.
+#[test]
+fn prices_what_the_batch_gives_back_once() {
+    let config = config();
+    let (owner, _) = keys();
+    let from = address_of(&owner);
+    let batch = base_tx(
+        TxType::CallMulti,
+        from,
+        TxPayload::CallMulti(TxMsgCallMulti {
+            calls: vec![burn_call(from, 9, vec![1]), burn_call(from, 9, vec![2])],
+        }),
+    );
+    let empty = plan_fees(
+        &batch,
+        &config,
+        &FeePlanOptions {
+            witness_count: Some(1),
+            infusions: Some(Vec::new()),
+            ..FeePlanOptions::default()
+        },
+    )
+    .unwrap();
+    let returned = plan_fees(
+        &batch,
+        &config,
+        &FeePlanOptions {
+            witness_count: Some(1),
+            infusions: Some(vec![InfusedAsset {
+                token_id: Some(7),
+                ..InfusedAsset::default()
+            }]),
+            ..FeePlanOptions::default()
+        },
+    )
+    .unwrap();
+    // One returned fungible token costs one transfer plus one owner-lookup query, which is 20 work
+    // units at these prices. Counting it per burn would double it.
+    assert_eq!(
+        returned.expected_gas_bill - empty.expected_gas_bill,
+        20 * 10_000
+    );
+    assert_eq!(
+        returned.max_data - empty.max_data,
+        config.data_escrow_per_row
+    );
+}
+
+/// The helper a planner with a chain uses to find the addresses it must read. It answers for the
+/// native burns, for a burn call, and for every burn inside a batch.
+#[test]
+fn names_every_instance_a_message_burns() {
+    let (owner, _) = keys();
+    let from = address_of(&owner);
+    let native = base_tx(
+        TxType::BurnNonFungible,
+        from,
+        TxPayload::BurnNonFungible(TxMsgBurnNonFungible {
+            token_id: 9,
+            instance_id: 4,
+        }),
+    );
+    assert_eq!(
+        burned_instances(&native),
+        vec![BurnedInstance {
+            token_id: 9,
+            instance_id: 4
+        }]
+    );
+    let batch = base_tx(
+        TxType::CallMulti,
+        from,
+        TxPayload::CallMulti(TxMsgCallMulti {
+            calls: vec![
+                burn_call(from, 9, vec![1, 2]),
+                burn_fungible_call(from),
+                burn_call(from, 5, vec![3]),
+            ],
+        }),
+    );
+    assert_eq!(
+        burned_instances(&batch),
+        vec![
+            BurnedInstance {
+                token_id: 9,
+                instance_id: 1
+            },
+            BurnedInstance {
+                token_id: 9,
+                instance_id: 2
+            },
+            BurnedInstance {
+                token_id: 5,
+                instance_id: 3
+            },
+        ]
+    );
+    let transfer = base_tx(
+        TxType::TransferFungible,
+        from,
+        TxPayload::TransferFungible(TxMsgTransferFungible {
+            to: from,
+            token_id: 9,
+            amount: 1,
+        }),
+    );
+    assert!(burned_instances(&transfer).is_empty());
+}
+
+/// The one call shape that cannot be priced from the message: its arguments are assembled from the
+/// results of earlier calls, so there is nothing to read them from yet.
+#[test]
+fn budgets_a_call_that_builds_its_arguments_at_execution_time() {
+    let config = config();
+    let (owner, _) = keys();
+    let from = address_of(&owner);
+    let sectioned = base_tx(
+        TxType::Call,
+        from,
+        TxPayload::Call(TxMsgCall {
+            module_id: ModuleId::Token as u32,
+            method_id: TokenContractMethod::BurnFungible as u32,
+            args: Vec::new(),
+            sections: Some(MsgCallArgSections {
+                sections: vec![CallArgSection {
+                    register_offset: -1,
+                    args: Vec::new(),
+                }],
+            }),
+        }),
+    );
+    assert_eq!(
+        plan_fees(
+            &sectioned,
+            &config,
+            &FeePlanOptions {
+                witness_count: Some(1),
+                ..FeePlanOptions::default()
+            }
+        )
+        .unwrap()
+        .kinds,
+        vec![NativeFeeKind::Script]
+    );
 }

@@ -181,3 +181,85 @@ async fn the_planner_is_owned_by_the_client_one_per_client() {
     other.fees().config(false).await.unwrap();
     assert_eq!(node.state().gas_config_reads, 2);
 }
+
+// A batch of burns is planned for what EVERY burned NFT holds. The planner reads one address per
+// instance, because the fee follows each returned asset separately, and hands the union to the pure
+// planner.
+#[tokio::test]
+async fn reads_one_address_per_burned_instance_of_a_batch() {
+    let (owner_keys, _) = keys();
+    let owner = address_of(&owner_keys);
+    let node = CannedNode::new();
+    {
+        let mut state = node.state();
+        state
+            .tokens
+            .insert("KCAL".into(), json!({"symbol": "KCAL", "carbonId": "1"}));
+        for (token_id, instance_id) in [(9u64, 1u64), (9, 2), (5, 3)] {
+            state.fungible.insert(
+                phantasma_sdk::get_nft_address(token_id, instance_id).to_string(),
+                vec![json!({"chain": "main", "symbol": "KCAL", "amount": "1", "decimals": 10})],
+            );
+        }
+    }
+    let burn_call = |token_id: u64, instance_ids: Vec<u64>| phantasma_sdk::TxMsgCall {
+        module_id: phantasma_sdk::ModuleId::Token as u32,
+        method_id: phantasma_sdk::TokenContractMethod::BurnNonFungible as u32,
+        args: phantasma_sdk::serialize(&phantasma_sdk::BurnNonFungibleArgs {
+            token_id,
+            from_address: owner,
+            instance_ids,
+        })
+        .unwrap(),
+        sections: None,
+    };
+    let batch = phantasma_sdk::TxMsg {
+        tx_type: phantasma_sdk::TxType::CallMulti,
+        expiry: 1_759_711_416_000,
+        max_gas: 0,
+        max_data: 0,
+        gas_from: owner,
+        payload: phantasma_sdk::SmallString::default(),
+        msg: phantasma_sdk::TxPayload::CallMulti(phantasma_sdk::TxMsgCallMulti {
+            calls: vec![burn_call(9, vec![1, 2]), burn_call(5, vec![3])],
+        }),
+    };
+
+    let client = node.client();
+    let options = PlanRequestOptions {
+        facts: FeePlanOptions {
+            witness_count: Some(1),
+            ..FeePlanOptions::default()
+        },
+        ..PlanRequestOptions::default()
+    };
+    let plan = client.fees().plan(&batch, &options).await.unwrap();
+    assert_eq!(node.state().infusion_reads, 3);
+    assert_eq!(
+        plan.kinds,
+        vec![
+            phantasma_sdk::NativeFeeKind::BurnNonFungible,
+            phantasma_sdk::NativeFeeKind::BurnNonFungible
+        ]
+    );
+
+    // The three returned assets are priced once for the batch, on its first burn: one transfer plus
+    // one owner-lookup query each, which is 20 work units apiece.
+    let config = client.fees().config(false).await.unwrap();
+    let empty = client
+        .fees()
+        .plan_with(
+            &config,
+            &batch,
+            &FeePlanOptions {
+                witness_count: Some(1),
+                infusions: Some(vec![]),
+                ..FeePlanOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        plan.expected_gas_bill - empty.expected_gas_bill,
+        3 * 20 * 10_000
+    );
+}

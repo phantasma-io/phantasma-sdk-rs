@@ -11,7 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use phantasma_sdk::{
     build_burn_non_fungible_tx, build_token_info, build_token_metadata, build_transfer_fungible_tx,
-    bytes32_from_public_key, deserialize, serialize, BurnNonFungibleParams, Bytes32,
+    bytes32_from_public_key, deserialize, serialize, BurnNonFungibleParams, Bytes32, GasConfig,
     GovernanceContractMethod, IntX, ModuleId, PhantasmaKeys, PhantasmaRpc, RegisterNameArgs,
     RpcTransport, SignedTxMsg, SmallString, TransferFungibleParams, TxLimits, TxMsg, TxMsgCall,
     TxPayload, TxType,
@@ -297,4 +297,46 @@ pub fn burn_tx(owner: Bytes32, token_id: u64, instance_id: u64) -> TxMsg {
         instance_id,
         ..BurnNonFungibleParams::default()
     })
+}
+
+/// The mainnet gas-model-v2 prices (special resolution #79), as the planner tests use them.
+pub fn v2_config() -> GasConfig {
+    GasConfig {
+        version: 1,
+        max_name_length: 255,
+        max_token_symbol_length: 255,
+        fee_multiplier: 10_000,
+        gas_token_id: 1,
+        data_token_id: 2,
+        minimum_gas_offer: 10,
+        data_escrow_per_row: 200_000,
+        legacy_data_escrow_per_row: 2,
+        minimum_gas_bill: 10_000_000,
+        gas_fee_transfer: 10,
+        gas_fee_query: 10,
+        gas_fee_create_token_base: 10_000_000_000,
+        gas_fee_create_token_symbol: 10_000_000_000,
+        gas_fee_create_token_series: 2_500_000_000,
+        gas_fee_per_byte: 250_000,
+        gas_fee_register_name: 10_000_000_000_000,
+        gas_burn_ratio_mul: 1,
+        policy_fee_create_token_base: 100_000_000_000_000,
+        policy_fee_create_token_symbol: 100_000_000_000_000,
+        policy_fee_create_token_series: 25_000_000_000_000,
+        policy_fee_register_name: 100_000_000_000_000_000,
+        ..GasConfig::default()
+    }
+}
+
+/// A message of `tx_type` with a fixed expiry and no limits, for tests that price it.
+pub fn base_tx(tx_type: TxType, gas_from: Bytes32, msg: TxPayload) -> TxMsg {
+    TxMsg {
+        tx_type,
+        expiry: 1_759_711_416_000,
+        max_gas: 0,
+        max_data: 0,
+        gas_from,
+        payload: SmallString::default(),
+        msg,
+    }
 }

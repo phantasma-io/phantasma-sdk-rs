@@ -6,7 +6,7 @@ use phantasma_sdk::{
 
 fn plan() -> FeePlan {
     FeePlan {
-        kind: NativeFeeKind::TransferFungible,
+        kinds: vec![NativeFeeKind::TransferFungible],
         envelope_bytes: 170,
         max_gas: 42_850_000,
         max_data: 200_000,

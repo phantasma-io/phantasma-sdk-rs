@@ -40,9 +40,11 @@ async fn main() -> Result<()> {
         .plan(&msg, &PlanRequestOptions::default())
         .await?;
     let summary = summarize_fee_plan(&plan);
+    let operations: Vec<String> = plan.kinds.iter().map(|kind| format!("{kind:?}")).collect();
     println!(
-        "Operation: {:?}, signed size {} bytes",
-        plan.kind, plan.envelope_bytes
+        "Operations: {}, signed size {} bytes",
+        operations.join(", "),
+        plan.envelope_bytes
     );
     println!(
         "Gas bill: {} KCAL (offer {} KCAL)",

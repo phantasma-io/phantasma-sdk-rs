@@ -29,7 +29,7 @@ use crate::encoding::{decode_hex, encode_hex};
 use crate::error::{rpc, PhantasmaError, Result};
 use crate::extended_events::EventData;
 use crate::fees::{
-    plan_fees, FeePlan, FeePlanOptions, FeeQuote, InfusedAsset,
+    burned_instances, plan_fees, FeePlan, FeePlanOptions, FeeQuote, InfusedAsset,
     GAS_MODEL_V2_UNITS_PER_BLOCK_DATA_BYTE,
 };
 use crate::transaction::{tx_state_is_fault, tx_state_is_success, Transaction};
@@ -168,7 +168,7 @@ struct CachedGasConfig {
 /// answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainFeeParams {
-    /// The longest lifetime the chain admits for a transaction - it refuses an expiry at or beyond
+    /// The longest lifetime the chain admits for a transaction. The chain refuses an expiry at or beyond
     /// now + `expiry_window`. Feed it to [`crate::expiry_within`] when a person sits between
     /// building a transaction and signing it.
     pub expiry_window: Duration,
@@ -259,7 +259,7 @@ impl<T: RpcTransport> FeePlanner<'_, T> {
         plan_fees(msg, &config, &facts)
     }
 
-    /// Plans a message against a config the caller already holds - no network, no cache.
+    /// Plans a message against a config the caller already holds. It touches no network and no cache.
     pub fn plan_with(
         &self,
         config: &GasConfig,
@@ -269,27 +269,34 @@ impl<T: RpcTransport> FeePlanner<'_, T> {
         plan_fees(msg, config, options)
     }
 
-    // Fills in what a burned NFT holds. A burn returns whatever the NFT's own address holds, and the
-    // chain charges for each returned asset. That set is chain state the message does not carry
-    // and has no costlier bound, so the pure planner demands it; here, with a chain to ask, it is
-    // read unless the caller stated it (an empty list states that the NFT holds nothing).
+    // Fills in what the burned NFTs hold. A burn returns whatever the NFT's own address holds, and
+    // the chain charges for each returned asset. That set is chain state the message does not carry,
+    // and it has no costlier bound, so the pure planner demands it. Here there is a chain to ask, so
+    // it is read unless the caller stated it. An empty list states that the NFTs hold nothing.
+    //
+    // A message may burn several instances. A wallet burning a selection sends a CallMulti of burns.
+    // Each instance is read at its own address, because the fee follows every returned asset
+    // separately.
     async fn with_infusions(&self, msg: &TxMsg, facts: &FeePlanOptions) -> Result<FeePlanOptions> {
         if facts.infusions.is_some() {
             return Ok(facts.clone());
         }
-        let (token_id, instance_id) = match &msg.msg {
-            TxPayload::BurnNonFungible(burn) => (burn.token_id, burn.instance_id),
-            TxPayload::BurnNonFungibleGasPayer(burn) => (burn.token_id, burn.instance_id),
-            _ => return Ok(facts.clone()),
-        };
-        let infusions = self
-            .client
-            .infused_assets(token_id, instance_id)
-            .await
-            .map_err(|err| PhantasmaError::Rpc {
-                code: None,
-                message: format!("reading what the burned NFT holds: {err}"),
-            })?;
+        let burned = burned_instances(msg);
+        if burned.is_empty() {
+            return Ok(facts.clone());
+        }
+        let mut infusions = Vec::new();
+        for instance in burned {
+            let held = self
+                .client
+                .infused_assets(instance.token_id, instance.instance_id)
+                .await
+                .map_err(|err| PhantasmaError::Rpc {
+                    code: None,
+                    message: format!("reading what the burned NFT holds: {err}"),
+                })?;
+            infusions.extend(held);
+        }
         Ok(FeePlanOptions {
             infusions: Some(infusions),
             ..facts.clone()
@@ -1606,15 +1613,15 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
     }
 
     /// Asks the chain whether the symbol a CreateToken claims is already in use. The call consumes
-    /// its policy fee - the largest single price in the protocol, set by governance and readable
-    /// from getGasConfig - before the contract looks at the symbol, so sending one that is taken
+    /// its policy fee before the contract looks at the symbol. That fee is the largest single price
+    /// in the protocol, governance sets it and getGasConfig reports it. Sending one that is taken
     /// pays that fee for nothing. One lookup answers it.
     ///
     /// A symbol that resolves to a token is [`PreflightVerdict::Taken`]. A symbol that does not is
     /// reported by the node as an ordinary RPC error, the same way it reports a missing method or
     /// a failed backend, and nothing in the answer separates those: every one of them arrives as
     /// the same internal error code with prose for a message. So an error alone is never read as
-    /// absence. Instead the check asks a second question it already knows the answer to - fetch
+    /// absence. So the check asks a second question whose answer it already knows: fetch
     /// the CONTROL token by its id, which the node resolves without touching the symbol at all. A
     /// node that answers that is a node that is answering, so its refusal about the caller's
     /// symbol is a real absence and the verdict is [`PreflightVerdict::Free`]; a node that does
@@ -1627,7 +1634,8 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
     /// error message.
     ///
     /// The verdict is reported rather than acted on; [`Self::send_tx_msg`] refuses on taken and on
-    /// unknown. The message's own validity - flags, metadata, schemas - is enforced by the
+    /// unknown. The builders enforce the message's own validity, which is flags, metadata and
+    /// schemas. That part is handled by the
     /// builders; this is the part only the chain can answer.
     pub async fn preflight_transaction(&self, msg: &TxMsg) -> Result<PreflightResult> {
         let not_applicable = PreflightResult {
