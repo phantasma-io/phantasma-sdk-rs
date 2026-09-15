@@ -560,6 +560,28 @@ fn carbon_tx_builders_match_golden_vectors() {
     }
 }
 
+#[test]
+fn carbon_tx_truncated_messages_are_refused() {
+    // Every prefix of a valid message cuts a field the reader still needs. A reader that cannot
+    // report the end of the stream accepts the prefix and hands back fields it never read; the C++
+    // SDK had that defect and this is the test that found it. A signed case carries a signature
+    // after the message, so a prefix of one can be a whole message and is not a truncation.
+    for (case_id, _source, expected_hex, _notes) in carbon_builder_rows() {
+        if case_id.starts_with("signed_") {
+            continue;
+        }
+        let data = hex::decode(&expected_hex).unwrap();
+        for length in 0..data.len() {
+            let parsed: Result<TxMsg, _> = deserialize(&data[..length]);
+            assert!(
+                parsed.is_err(),
+                "{case_id} accepted a prefix of {length} bytes out of {}",
+                data.len()
+            );
+        }
+    }
+}
+
 fn carbon_tx_builder_vector(case_id: &str) -> String {
     let keys =
         PhantasmaKeys::from_wif("KwPpBSByydVKqStGHAnZzQofCqhDmD2bfRgc9BmZqM3ZmsdWJw4d").unwrap();
