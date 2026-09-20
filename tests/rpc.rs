@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use httpmock::{Method::POST, MockServer};
 use phantasma_sdk::{
-    convert_decimals, parse_json_rpc_response, parse_json_rpc_response_for_request, PhantasmaError,
-    PhantasmaRpc, RpcTransport,
+    convert_decimals, decode_hex, parse_json_rpc_response, parse_json_rpc_response_for_request,
+    PhantasmaError, PhantasmaKeys, PhantasmaRpc, RpcTransport, Transaction, DEFAULT_TX_EXPIRY,
 };
 use serde_json::{json, Value};
 
@@ -1280,4 +1280,72 @@ fn vm_values_normalize_untyped_scalars() {
         Some("7")
     );
     assert_eq!(items[1].as_text(), Some("text"));
+}
+
+// A chain refuses an expiry at or beyond its own window, and that window can be as short as the
+// node default. Both transaction paths are admitted by that same check, so they stamp the same
+// lifetime. The classic transaction counts in seconds while the Carbon default is a duration.
+#[tokio::test]
+async fn sign_and_send_transaction_stamps_the_carbon_default_lifetime() {
+    let (client, transport) = script_sender();
+    let keys =
+        PhantasmaKeys::from_wif("KwPpBSByydVKqStGHAnZzQofCqhDmD2bfRgc9BmZqM3ZmsdWJw4d").unwrap();
+    let lifetime = DEFAULT_TX_EXPIRY.as_secs() as u32;
+
+    let before = unix_seconds();
+    client
+        .sign_and_send_transaction(&keys, "simnet", &[0x0d, 0x00, 0x0b], "main", &[], None)
+        .await
+        .unwrap();
+    let after = unix_seconds();
+
+    let expiration = broadcast_transaction(&transport).expiration;
+    assert!(
+        expiration >= before + lifetime && expiration <= after + lifetime,
+        "expiration {expiration} is not {lifetime}s from now"
+    );
+}
+
+#[tokio::test]
+async fn sign_and_send_transaction_keeps_the_expiration_the_caller_passes() {
+    let (client, transport) = script_sender();
+    let keys =
+        PhantasmaKeys::from_wif("KwPpBSByydVKqStGHAnZzQofCqhDmD2bfRgc9BmZqM3ZmsdWJw4d").unwrap();
+
+    client
+        .sign_and_send_transaction(
+            &keys,
+            "simnet",
+            &[0x0d, 0x00, 0x0b],
+            "main",
+            &[],
+            Some(1_900_000_000),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(broadcast_transaction(&transport).expiration, 1_900_000_000);
+}
+
+fn script_sender() -> (PhantasmaRpc<MockTransport>, MockTransport) {
+    let transport =
+        MockTransport::with_response((200, json!({"jsonrpc": "2.0", "id": "1", "result": "HASH"})));
+    let client = PhantasmaRpc::with_transport("http://localhost:5172/rpc", transport.clone());
+    (client, transport)
+}
+
+fn unix_seconds() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32
+}
+
+// The script path builds, signs and broadcasts inside one call, so what it stamped is read back
+// from the transaction the node was given.
+fn broadcast_transaction(transport: &MockTransport) -> Transaction {
+    let requests = transport.requests();
+    assert_eq!(requests[0]["method"], "sendRawTransaction");
+    let encoded = requests[0]["params"][0].as_str().unwrap();
+    Transaction::from_bytes(&decode_hex(encoded).unwrap()).unwrap()
 }

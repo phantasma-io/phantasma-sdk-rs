@@ -23,6 +23,7 @@ use crate::carbon::{
     deserialize, get_nft_address, parse_create_token_result, parse_create_token_series_result,
     required_witnesses, serialize, sign_and_serialize_tx_msg_with, Bytes32, GasConfig, ModuleId,
     SignedTxMsg, TokenContractMethod, TokenInfo, TxMsg, TxPayload, TxSigner, TxType,
+    DEFAULT_TX_EXPIRY,
 };
 use crate::crypto::PhantasmaKeys;
 use crate::encoding::{decode_hex, encode_hex};
@@ -1481,6 +1482,11 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
             .await
     }
 
+    /// Builds, signs and broadcasts a classic VM transaction.
+    ///
+    /// `expiration` is a unix time in seconds. `None` stamps [`DEFAULT_TX_EXPIRY`] from now, the
+    /// same lifetime a Carbon transaction gets. A flow with a person in it should take the chain's own
+    /// window instead, see [`expiry_within`](crate::carbon::expiry_within).
     pub async fn sign_and_send_transaction(
         &self,
         keys: &PhantasmaKeys,
@@ -1936,12 +1942,17 @@ fn coerce_bool(value: Value) -> Result<bool> {
     )
 }
 
+/// The expiration a classic VM transaction gets when the caller names none.
+///
+/// It is [`DEFAULT_TX_EXPIRY`] from now, the same lifetime a Carbon transaction gets: the chain admits
+/// both kinds of transaction with the same check against its own expiry window. This transaction
+/// carries its expiration in seconds, while the Carbon default is a duration.
 fn default_expiration_seconds() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-        .saturating_add(20 * 60) as u32
+        .saturating_add(DEFAULT_TX_EXPIRY.as_secs()) as u32
 }
 
 pub fn convert_decimals(amount: &str, decimals: u32) -> String {
