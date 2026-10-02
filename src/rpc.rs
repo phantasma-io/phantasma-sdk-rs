@@ -681,8 +681,8 @@ impl<T: RpcTransport> PhantasmaRpc<T> {
     /// exact fee bill with recommended max_gas/max_data ceilings (gas-model-v2 Tier-2 estimate).
     /// Signatures inside the envelope may be zero-filled dummies of the correct length - the
     /// simulation skips signature checks, and dummies preserve the exact envelope byte length the
-    /// bill depends on. Until the estimate service is launched this returns a standard RPC error;
-    /// use `estimate_native_fee` with [`Self::get_gas_config`] as the fallback.
+    /// bill depends on. A node with the estimate service switched off answers with a standard RPC
+    /// error. [`Self::fees`] plans a fee without that service.
     pub async fn estimate_transaction(&self, tx_data: &str) -> Result<EstimateTransactionResult> {
         self.call("estimateTransaction", vec![json!(tx_data)]).await
     }
