@@ -4368,7 +4368,7 @@ pub fn sign_and_serialize_tx_msg_hex(msg: &TxMsg, keys: &PhantasmaKeys) -> Resul
 /// transaction type: a gas-payer transfer takes the gas payer's and the owner's keys in any order,
 /// a Call takes the keys of every witness the contract will check, in the order they are to appear.
 pub fn sign_tx_msg_with_keys(msg: &TxMsg, keys: &[&PhantasmaKeys]) -> Result<SignedTxMsg> {
-    assert_planned(msg)?;
+    assert_signable(msg)?;
     let addresses = keys
         .iter()
         .map(|key| bytes32_from_public_key(&key.public_key()))
@@ -4404,7 +4404,7 @@ pub fn sign_and_serialize_tx_msg_with_keys(
 /// One account can fill two witness slots, when it pays the gas and owns the tokens. Such a signer
 /// is asked once and its signature is reused.
 pub async fn sign_tx_msg_with(msg: &TxMsg, signers: &[&dyn TxSigner]) -> Result<SignedTxMsg> {
-    assert_planned(msg)?;
+    assert_signable(msg)?;
     let addresses = signers
         .iter()
         .map(|signer| bytes32_from_public_key(&signer.public_key()))
@@ -4435,14 +4435,32 @@ pub async fn sign_and_serialize_tx_msg_with(
     serialize(&sign_tx_msg_with(msg, signers).await?)
 }
 
-// A zero gas offer is never admissible, so it marks a message that was built but not planned;
-// signing it would only produce a rejection. Plan with `PhantasmaRpc::fees` / `plan_fees`, or set
-// `max_gas` deliberately.
-fn assert_planned(msg: &TxMsg) -> Result<()> {
+// Refuses, before anything is signed, a message the chain is certain to refuse.
+fn assert_signable(msg: &TxMsg) -> Result<()> {
+    // A zero gas offer is never admissible, so it marks a message that was built but not planned.
+    // Plan with `PhantasmaRpc::fees` / `plan_fees`, or set `max_gas` deliberately.
     if msg.max_gas == 0 {
         return builder(
             "transaction has no gas offer: plan its fees or set max_gas before signing",
         );
+    }
+    // A native fungible transfer carries its amount as a u64, and the chain reads it as a signed
+    // 64-bit value. An amount of 2^63 or more fails on chain for every fungible token, big-fungible
+    // ones included, and the failed transaction is billed. A larger amount needs a
+    // `Token.TransferFungible` module call or a script transfer.
+    let amount = match (&msg.tx_type, &msg.msg) {
+        (TxType::TransferFungible, TxPayload::TransferFungible(body)) => Some(body.amount),
+        (TxType::TransferFungibleGasPayer, TxPayload::TransferFungibleGasPayer(body)) => {
+            Some(body.amount)
+        }
+        _ => None,
+    };
+    if let Some(amount) = amount {
+        if amount > i64::MAX as u64 {
+            return builder(format!(
+                "transfer amount {amount} is above the int64 maximum the chain accepts in a native transfer"
+            ));
+        }
     }
     Ok(())
 }

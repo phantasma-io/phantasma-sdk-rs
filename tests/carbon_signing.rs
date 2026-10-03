@@ -256,6 +256,61 @@ fn an_unplanned_message_is_refused() {
     assert!(message.contains("no gas offer"), "{message}");
 }
 
+// The chain reads a native transfer amount as a signed 64-bit value, so 2^63 fails on chain and the
+// int64 maximum does not. Both transfer types and both signing paths refuse it before anything is
+// signed.
+#[tokio::test]
+async fn a_native_transfer_above_the_int64_maximum_is_refused() {
+    let (payer_keys, owner_keys) = keys();
+    let (payer, owner) = (address_of(&payer_keys), address_of(&owner_keys));
+    let plain = |amount: u64| {
+        let mut msg = native_transfer(payer, owner, 42_600_000);
+        if let TxPayload::TransferFungible(body) = &mut msg.msg {
+            body.amount = amount;
+        }
+        msg
+    };
+    let with_gas_payer = |amount: u64| {
+        let mut msg = gas_payer_transfer(payer, owner, Bytes32([0x33; 32]));
+        if let TxPayload::TransferFungibleGasPayer(body) = &mut msg.msg {
+            body.amount = amount;
+        }
+        msg
+    };
+    let int64_max = i64::MAX as u64;
+
+    let refused = builder_message(sign_tx_msg(&plain(int64_max + 1), &payer_keys).unwrap_err());
+    assert!(refused.contains("int64 maximum"), "{refused}");
+    let refused = builder_message(
+        sign_tx_msg_with_keys(&with_gas_payer(int64_max + 1), &[&payer_keys, &owner_keys])
+            .unwrap_err(),
+    );
+    assert!(refused.contains("int64 maximum"), "{refused}");
+    let payer_signer = CountingSigner::new(payer_keys.clone());
+    let refused = builder_message(
+        sign_tx_msg_with(&plain(int64_max + 1), &[&payer_signer])
+            .await
+            .unwrap_err(),
+    );
+    assert!(refused.contains("int64 maximum"), "{refused}");
+    assert_eq!(payer_signer.calls.load(Ordering::SeqCst), 0);
+
+    assert_eq!(
+        sign_tx_msg(&plain(int64_max), &payer_keys)
+            .unwrap()
+            .witnesses
+            .len(),
+        1
+    );
+    assert_eq!(
+        sign_tx_msg_with_keys(&with_gas_payer(int64_max), &[&payer_keys, &owner_keys])
+            .unwrap()
+            .witnesses
+            .len(),
+        2
+    );
+}
+
 // The single-witness path keeps its historical behaviour and is the same signature the signer
 // interface produces.
 #[tokio::test]
