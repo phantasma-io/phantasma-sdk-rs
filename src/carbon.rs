@@ -3548,7 +3548,9 @@ pub struct TransferFungibleParams {
     pub gas_payer: Option<Bytes32>,
     pub to: Bytes32,
     pub token_id: u64,
-    /// In the token's atoms (u64; big-fungible tokens need a script transfer).
+    /// In the token's atoms. A big-fungible token moves this way too. The chain reads the amount as
+    /// a signed 64-bit value, so it refuses one above the int64 maximum. A larger amount needs a
+    /// `Token.TransferFungible` module call or a script transfer, whose amounts are big integers.
     pub amount: u64,
 }
 
