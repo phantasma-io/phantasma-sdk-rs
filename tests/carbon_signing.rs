@@ -256,11 +256,11 @@ fn an_unplanned_message_is_refused() {
     assert!(message.contains("no gas offer"), "{message}");
 }
 
-// The chain reads a native transfer amount as a signed 64-bit value, so 2^63 fails on chain and the
-// int64 maximum does not. Both transfer types and both signing paths refuse it before anything is
-// signed.
+// The chain reads a native transfer amount as a signed 64-bit value that must be above zero, so zero
+// and 2^63 fail on chain while 1 and the int64 maximum do not. Both transfer types and both signing
+// paths refuse the first two before anything is signed.
 #[tokio::test]
-async fn a_native_transfer_above_the_int64_maximum_is_refused() {
+async fn a_native_transfer_amount_the_chain_refuses_is_refused() {
     let (payer_keys, owner_keys) = keys();
     let (payer, owner) = (address_of(&payer_keys), address_of(&owner_keys));
     let plain = |amount: u64| {
@@ -295,20 +295,36 @@ async fn a_native_transfer_above_the_int64_maximum_is_refused() {
     assert!(refused.contains("int64 maximum"), "{refused}");
     assert_eq!(payer_signer.calls.load(Ordering::SeqCst), 0);
 
-    assert_eq!(
-        sign_tx_msg(&plain(int64_max), &payer_keys)
-            .unwrap()
-            .witnesses
-            .len(),
-        1
+    let refused = builder_message(sign_tx_msg(&plain(0), &payer_keys).unwrap_err());
+    assert!(refused.contains("above zero"), "{refused}");
+    let refused = builder_message(
+        sign_tx_msg_with_keys(&with_gas_payer(0), &[&payer_keys, &owner_keys]).unwrap_err(),
     );
-    assert_eq!(
-        sign_tx_msg_with_keys(&with_gas_payer(int64_max), &[&payer_keys, &owner_keys])
-            .unwrap()
-            .witnesses
-            .len(),
-        2
+    assert!(refused.contains("above zero"), "{refused}");
+    let refused = builder_message(
+        sign_tx_msg_with(&plain(0), &[&payer_signer])
+            .await
+            .unwrap_err(),
     );
+    assert!(refused.contains("above zero"), "{refused}");
+    assert_eq!(payer_signer.calls.load(Ordering::SeqCst), 0);
+
+    for amount in [1, int64_max] {
+        assert_eq!(
+            sign_tx_msg(&plain(amount), &payer_keys)
+                .unwrap()
+                .witnesses
+                .len(),
+            1
+        );
+        assert_eq!(
+            sign_tx_msg_with_keys(&with_gas_payer(amount), &[&payer_keys, &owner_keys])
+                .unwrap()
+                .witnesses
+                .len(),
+            2
+        );
+    }
 }
 
 // The single-witness path keeps its historical behaviour and is the same signature the signer

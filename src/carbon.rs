@@ -3549,8 +3549,9 @@ pub struct TransferFungibleParams {
     pub to: Bytes32,
     pub token_id: u64,
     /// In the token's atoms. A big-fungible token moves this way too. The chain reads the amount as
-    /// a signed 64-bit value, so it refuses one above the int64 maximum. A larger amount needs a
-    /// `Token.TransferFungible` module call or a script transfer, whose amounts are big integers.
+    /// a signed 64-bit value, so it refuses zero and anything above the int64 maximum. A larger
+    /// amount needs a `Token.TransferFungible` module call or a script transfer, whose amounts are big
+    /// integers.
     pub amount: u64,
 }
 
@@ -4445,9 +4446,9 @@ fn assert_signable(msg: &TxMsg) -> Result<()> {
         );
     }
     // A native fungible transfer carries its amount as a u64, and the chain reads it as a signed
-    // 64-bit value. An amount of 2^63 or more fails on chain for every fungible token, big-fungible
-    // ones included, and the failed transaction is billed. A larger amount needs a
-    // `Token.TransferFungible` module call or a script transfer.
+    // 64-bit value that must be above zero. Zero, and an amount of 2^63 or more, fail on chain for
+    // every fungible token, big-fungible ones included, and the failed transaction is billed. A
+    // larger amount needs a `Token.TransferFungible` module call or a script transfer.
     let amount = match (&msg.tx_type, &msg.msg) {
         (TxType::TransferFungible, TxPayload::TransferFungible(body)) => Some(body.amount),
         (TxType::TransferFungibleGasPayer, TxPayload::TransferFungibleGasPayer(body)) => {
@@ -4456,6 +4457,9 @@ fn assert_signable(msg: &TxMsg) -> Result<()> {
         _ => None,
     };
     if let Some(amount) = amount {
+        if amount == 0 {
+            return builder("transfer amount must be above zero for a native transfer");
+        }
         if amount > i64::MAX as u64 {
             return builder(format!(
                 "transfer amount {amount} is above the int64 maximum the chain accepts in a native transfer"
