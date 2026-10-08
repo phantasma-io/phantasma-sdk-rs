@@ -330,6 +330,47 @@ fn script_builder_resolves_labels_per_instance() {
     );
 }
 
+// A JMP takes 3 bytes and the label's NOP 1, so after `fill` zero bytes the label sits at fill + 4.
+fn jump_over(fill: usize) -> phantasma_sdk::Result<Vec<u8>> {
+    let mut builder = ScriptBuilder::begin();
+    builder
+        .emit_jump(Opcode::Jmp, "far", 0)
+        .emit_raw(vec![0u8; fill])
+        .emit_label("far");
+    builder.end_script()
+}
+
+// A CALL takes 4 bytes and the label's NOP 1, so after `fill` zero bytes the label sits at fill + 5.
+fn call_over(fill: usize) -> phantasma_sdk::Result<Vec<u8>> {
+    let mut builder = ScriptBuilder::begin();
+    builder
+        .emit_call("far", 1)
+        .emit_raw(vec![0u8; fill])
+        .emit_label("far");
+    builder.end_script()
+}
+
+#[test]
+fn script_builder_jump_reaches_offset_32767_and_no_farther() {
+    // The chain reads a jump target as a signed 16-bit number and refuses 0x8000 or more.
+    assert!(jump_over(32763).is_ok());
+    let error = jump_over(32764).unwrap_err().to_string();
+    assert!(error.contains("above 32767"), "{error}");
+}
+
+#[test]
+fn script_builder_call_reaches_offset_65535_and_no_farther() {
+    // 32769 is 0x8001: beyond the jump limit, and still a valid call target.
+    let script = call_over(32764).unwrap();
+    assert_eq!(script[2..4], [0x01, 0x80]);
+
+    assert!(call_over(65530).is_ok());
+    // 65536 does not fit two bytes. Without the check it would be cut to 0, a call to the start of
+    // the script.
+    let error = call_over(65531).unwrap_err().to_string();
+    assert!(error.contains("above 65535"), "{error}");
+}
+
 #[test]
 fn script_builder_runtime_helper_parity() {
     let keys =

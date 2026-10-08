@@ -4,7 +4,7 @@
 //! error handling: builder methods latch errors and `end_script()` reports them
 //! instead of emitting partially invalid scripts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
@@ -442,6 +442,8 @@ pub struct ScriptBuilder {
     writer: BinaryWriter,
     jump_locations: BTreeMap<usize, String>,
     label_locations: BTreeMap<String, usize>,
+    // The offsets in `jump_locations` that a CALL reserved. Every other offset belongs to a jump.
+    call_offsets: BTreeSet<usize>,
     // Builder methods return `&mut Self` for chaining, so invalid
     // operations are stored and surfaced only when the final script is requested.
     error: Option<PhantasmaError>,
@@ -456,11 +458,17 @@ impl Default for ScriptBuilder {
 impl ScriptBuilder {
     pub const MAX_REGISTER_COUNT: u8 = 32;
 
+    // The farthest targets the chain accepts. It reads a target from two bytes: a jump target as a
+    // signed number, a call target as an unsigned one.
+    const MAX_JUMP_TARGET: usize = i16::MAX as usize;
+    const MAX_CALL_TARGET: usize = u16::MAX as usize;
+
     pub fn new() -> Self {
         Self {
             writer: BinaryWriter::new(),
             jump_locations: BTreeMap::new(),
             label_locations: BTreeMap::new(),
+            call_offsets: BTreeSet::new(),
             error: None,
         }
     }
@@ -505,6 +513,16 @@ impl ScriptBuilder {
             let Some(target) = self.label_locations.get(&normalized) else {
                 return builder(format!("could not find label: {label}"));
             };
+            let limit = if self.call_offsets.contains(offset) {
+                Self::MAX_CALL_TARGET
+            } else {
+                Self::MAX_JUMP_TARGET
+            };
+            if *target > limit {
+                return builder(format!(
+                    "label offset {target} is above {limit}, the largest target allowed here"
+                ));
+            }
             if *offset + 1 >= script.len() {
                 return builder(format!("invalid jump patch offset: {offset}"));
             }
@@ -618,6 +636,7 @@ impl ScriptBuilder {
         let offset = self.current_size();
         self.writer.write_u16_le(0);
         self.jump_locations.insert(offset, label.to_string());
+        self.call_offsets.insert(offset);
         self
     }
 
