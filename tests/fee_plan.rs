@@ -3,15 +3,16 @@
 
 use phantasma_sdk::{
     build_and_serialize_token_schemas, build_create_token_series_tx, build_create_token_tx,
-    build_mint_phantasma_non_fungible_tx, build_series_info, build_token_info,
-    build_token_metadata, burned_instances, bytes32_from_public_key, deserialize, envelope_bytes,
-    estimate_native_fee, get_nft_address, is_nft_address, plan_fees, serialize, unpack_nft_address,
-    BurnFungibleArgs, BurnNonFungibleArgs, BurnedInstance, Bytes32, CallArgSection, FeePlan,
-    FeePlanOptions, GasConfig, GovernanceContractMethod, InfusedAsset, IntX, ModuleId,
-    MsgCallArgSections, NativeFeeKind, NativeFeeParams, PhantasmaKeys, PhantasmaNFTMintInfo,
-    RegisterNameArgs, SmallString, TokenContractMethod, TxLimits, TxMsg, TxMsgBurnNonFungible,
-    TxMsgCall, TxMsgCallMulti, TxMsgMintNonFungible, TxMsgPhantasma, TxMsgTransferFungible,
+    build_mint_phantasma_non_fungible_tx, build_series_info, build_token_info, burned_instances,
+    bytes32_from_public_key, deserialize, envelope_bytes, estimate_native_fee, get_nft_address,
+    is_nft_address, plan_fees, serialize, unpack_nft_address, BurnFungibleArgs,
+    BurnNonFungibleArgs, BurnedInstance, Bytes32, CallArgSection, FeePlan, FeePlanOptions,
+    GasConfig, GovernanceContractMethod, InfusedAsset, IntX, ModuleId, MsgCallArgSections,
+    NativeFeeKind, NativeFeeParams, PhantasmaKeys, PhantasmaNFTMintInfo, RegisterNameArgs,
+    SmallString, TokenContractMethod, TxLimits, TxMsg, TxMsgBurnNonFungible, TxMsgCall,
+    TxMsgCallMulti, TxMsgMintNonFungible, TxMsgPhantasma, TxMsgTransferFungible,
     TxMsgTransferFungibleGasPayer, TxMsgTransferNonFungibleMulti, TxPayload, TxType,
+    VMDynamicStruct, VMDynamicVariable, VMNamedDynamicVariable,
 };
 
 /// The single operation a plan priced. A plan that priced none or several is a test that asked the
@@ -94,16 +95,22 @@ fn transfer(to: Bytes32, token_id: u64) -> TxMsg {
     )
 }
 
-fn create_token(symbol: &str, is_nft: bool, extra: &[(&str, &str)]) -> TxMsg {
+// Returns a token creation whose metadata holds the string fields and the extra typed fields. The
+// chain's own keys hold typed values, which the string-field builder refuses, so the metadata is
+// written as the struct the chain reads.
+fn create_token(symbol: &str, is_nft: bool, extra: &[VMNamedDynamicVariable]) -> TxMsg {
     let (creator, _) = keys();
-    let mut fields = vec![
+    let mut fields: Vec<_> = [
         ("name", "Planned"),
         ("icon", ICON),
         ("url", "https://example.com"),
         ("description", "a planned token"),
-    ];
+    ]
+    .into_iter()
+    .map(|(name, value)| VMNamedDynamicVariable::new(name, VMDynamicVariable::string(value)))
+    .collect();
     fields.extend_from_slice(extra);
-    let metadata = build_token_metadata(&fields).unwrap();
+    let metadata = serialize(&VMDynamicStruct::new(fields)).unwrap();
     let info = build_token_info(
         symbol,
         IntX::from(0i64),
@@ -119,6 +126,12 @@ fn create_token(symbol: &str, is_nft: bool, extra: &[(&str, &str)]) -> TxMsg {
     )
     .unwrap();
     build_create_token_tx(info, address_of(&creator), fixed_expiry()).unwrap()
+}
+
+// Returns the chain setting `key` with the Int64 1, a typed value as the chain takes it. The planner
+// reads only whether the key is there.
+fn chain_setting(key: &str) -> VMNamedDynamicVariable {
+    VMNamedDynamicVariable::new(key, VMDynamicVariable::int64(1))
 }
 
 fn phantasma_mint(series_ids: &[i64], rom_bytes: usize, to: Bytes32) -> TxMsg {
@@ -288,13 +301,13 @@ fn reads_a_token_creation_out_of_its_call() {
     // The staking keys cost a lookup each; the pre-burn and inflation keys write a row each.
     let plain = plan_fees(&create_token("PLANNED", false, &[]), &config(), &options).unwrap();
     let org = plan_fees(
-        &create_token("PLANNED", false, &[("_soi", "1")]),
+        &create_token("PLANNED", false, &[chain_setting("_soi")]),
         &config(),
         &options,
     )
     .unwrap();
     let reward = plan_fees(
-        &create_token("PLANNED", false, &[("_srt", "1")]),
+        &create_token("PLANNED", false, &[chain_setting("_srt")]),
         &config(),
         &options,
     )
@@ -314,14 +327,14 @@ fn reads_a_token_creation_out_of_its_call() {
         100_000
     );
     let pre_burn = plan_fees(
-        &create_token("PLANNED", false, &[("_brn", "1")]),
+        &create_token("PLANNED", false, &[chain_setting("_brn")]),
         &config(),
         &options,
     )
     .unwrap();
     assert_eq!(pre_burn.new_storage_quanta, plain.new_storage_quanta + 1);
     let inflation = plan_fees(
-        &create_token("PLANNED", false, &[("_ip", "1")]),
+        &create_token("PLANNED", false, &[chain_setting("_ip")]),
         &config(),
         &options,
     )

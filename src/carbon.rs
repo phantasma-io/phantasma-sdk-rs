@@ -156,6 +156,12 @@ pub mod standard_meta {
     pub const TOKEN_PHANTASMA_ABI: &str = "_phb";
     pub const TOKEN_PRE_BURN: &str = "_brn";
     pub const TOKEN_INFLATION_PERIOD: &str = "_ip";
+    pub const TOKEN_INFLATION_AMOUNTS: &str = "_ia";
+    pub const TOKEN_INFLATION_INITIAL_BEGIN: &str = "_iib";
+    pub const TOKEN_INFLATION_INITIAL_END: &str = "_iie";
+    /// The inflation reset, the Int64 0 or 1. The chain applies it when an update carries it, and
+    /// it does not store it.
+    pub const TOKEN_INFLATION_FORCE_RESET: &str = "_ifr";
     /// The contract seal. A token whose metadata holds this key with the Int64 1 never gets a VM
     /// contract; see [`crate::TokenMetadataOptions::seal_contract`].
     pub const TOKEN_SEALED_CONTRACT: &str = "_sealed_c";
@@ -3942,7 +3948,8 @@ pub struct TokenMetadataOptions {
 }
 
 /// Returns the serialized metadata of a new token. `fields` must hold `name`, `icon`, `url` and
-/// `description`; `icon` is a base64 data URI of a PNG, JPEG or WebP image.
+/// `description`; `icon` is a base64 data URI of a PNG, JPEG or WebP image. No key may start with
+/// `_`, because the chain keeps such keys for its own settings.
 pub fn build_token_metadata(fields: &[(&str, &str)]) -> Result<Vec<u8>> {
     build_token_metadata_with_options(fields, TokenMetadataOptions::default())
 }
@@ -3962,6 +3969,14 @@ pub fn build_token_metadata_with_options(
         return builder(
             "pass TokenMetadataOptions { seal_contract: true } to seal a token against contracts: _sealed_c holds the Int64 1, which a string field cannot carry",
         );
+    }
+    // The chain keeps the keys that start with `_` for its own settings and refuses any other such
+    // key. Its settings are typed values, so a string field that starts with `_` is never a valid
+    // setting.
+    if let Some((name, _)) = fields.iter().find(|(name, _)| name.starts_with('_')) {
+        return builder(format!(
+            "{name} is reserved for the chain: string metadata fields cannot start with _"
+        ));
     }
     for required in ["name", "icon", "url", "description"] {
         let Some((_, value)) = fields.iter().find(|(name, _)| *name == required) else {
@@ -4184,6 +4199,28 @@ pub fn build_create_token_tx_and_sign_hex(
     )?))
 }
 
+// The `_` keys an update may set: the chain's own settings, and `_ifr`, the inflation reset that the
+// chain applies and does not store. `_brn` is not among them, because only genesis sets it.
+const UPDATABLE_CHAIN_KEYS: [&str; 17] = [
+    standard_meta::TOKEN_STAKING_ORG_ID,
+    standard_meta::TOKEN_STAKING_ORG_THRESHOLD,
+    standard_meta::TOKEN_STAKING_REWARD_TOKEN,
+    standard_meta::TOKEN_STAKING_REWARD_PERIOD,
+    standard_meta::TOKEN_STAKING_REWARD_MUL,
+    standard_meta::TOKEN_STAKING_REWARD_DIV,
+    standard_meta::TOKEN_STAKING_LOCK,
+    standard_meta::TOKEN_STAKING_BOOSTER_TOKEN,
+    standard_meta::TOKEN_STAKING_BOOSTER_MUL,
+    standard_meta::TOKEN_STAKING_BOOSTER_DIV,
+    standard_meta::TOKEN_STAKING_BOOSTER_LIMIT,
+    standard_meta::TOKEN_INFLATION_PERIOD,
+    standard_meta::TOKEN_INFLATION_AMOUNTS,
+    standard_meta::TOKEN_INFLATION_INITIAL_BEGIN,
+    standard_meta::TOKEN_INFLATION_INITIAL_END,
+    standard_meta::TOKEN_INFLATION_FORCE_RESET,
+    standard_meta::TOKEN_SEALED_CONTRACT,
+];
+
 /// Builds a Token.UpdateTokenMetadata call, which the token owner or governance sends to change a
 /// token's metadata. The message carries the limits given and nothing else; see
 /// [`build_create_token_tx`]. [`build_contract_seal_update`] returns the update that seals a token
@@ -4192,7 +4229,9 @@ pub fn build_create_token_tx_and_sign_hex(
 /// The chain merges the update into the stored metadata field by field, so a field the update
 /// leaves out keeps its value. A field is removed by sending it as an empty
 /// [`VMType::ArrayDynamic`] value, the only form the chain reads as a removal. A
-/// [`VMType::Dynamic`] value without data is stored like any other value.
+/// [`VMType::Dynamic`] value without data is stored like any other value. The keys that start with
+/// `_` belong to the chain. An update may set the chain's own settings, and it may name any other
+/// such key only to remove it. An update may not name `_brn` at all.
 ///
 /// The planner has no formula for this call and prices it with the script budget, so the plan is
 /// an upper bound (`exact` is false). The chain charges the transfer fee and the storage the
@@ -4216,6 +4255,22 @@ pub fn build_update_token_metadata_tx(
             && *field != contract_seal_field()
     }) {
         return builder("_sealed_c must be the Int64 1: build it with build_contract_seal_update");
+    }
+    // Only genesis sets `_brn`, so the chain refuses an update that names it, a removal included.
+    if metadata.get(standard_meta::TOKEN_PRE_BURN).is_some() {
+        return builder("_brn is set at genesis only");
+    }
+    // The chain refuses metadata that keeps a `_` key it does not define. A token may hold such a
+    // key from before the chain reserved these keys. Only an update that removes the key can then
+    // succeed.
+    if let Some(field) = metadata.fields.iter().find(|field| {
+        let key = field.name.as_str();
+        key.starts_with('_') && !UPDATABLE_CHAIN_KEYS.contains(&key) && !removes_field(&field.value)
+    }) {
+        return builder(format!(
+            "{} is reserved for the chain: an update can only remove it",
+            field.name
+        ));
     }
     let args = UpdateTokenMetadataArgs { token_id, metadata };
     Ok(call_tx(
@@ -4256,6 +4311,13 @@ pub fn build_update_token_metadata_tx_and_sign_hex(
     Ok(hex::encode(build_update_token_metadata_tx_and_sign(
         token_id, metadata, signer, config, options,
     )?))
+}
+
+// Returns true if the value removes its field. The chain reads only an empty Array_Dynamic as a
+// removal.
+fn removes_field(value: &VMDynamicVariable) -> bool {
+    value.vm_type == VMType::ArrayDynamic
+        && matches!(&value.data, VMValue::ArrayDynamic(items) if items.is_empty())
 }
 
 /// Builds a CreateTokenSeries call with the limits given; see [`build_create_token_tx`].

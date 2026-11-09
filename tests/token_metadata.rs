@@ -1,9 +1,12 @@
-//! Token metadata: the contract seal at creation and as an update, and the Token.UpdateTokenMetadata
-//! builder.
+//! Token metadata: the contract seal at creation and as an update, the Token.UpdateTokenMetadata
+//! builder, and the metadata keys the chain keeps for itself.
 //!
-//! The seal is `_sealed_c` holding the Int64 1, and the chain refuses it with any other type or value.
-//! An update removes a field with an empty Array_Dynamic, the only value the chain reads as a
-//! removal. These tests hold the builders of the SDK to the same rules.
+//! The chain keeps the token metadata keys that start with `_` for its own settings: staking,
+//! inflation and the contract seal. It refuses any other such key in the metadata a token is left
+//! with. It also refuses `_brn` in an update, because only genesis sets it. An update may still name
+//! another `_` key to remove it, with an empty Array_Dynamic, the only value the chain reads as a
+//! removal. The seal is `_sealed_c` holding the Int64 1, and the chain refuses it with any other type
+//! or value. These tests hold the builders of the SDK to the same rules.
 
 mod common;
 
@@ -139,11 +142,12 @@ fn writes_no_seal_without_the_option() {
 }
 
 // A string field cannot carry the Int64 the chain takes for the seal, so the key is refused with a
-// message that names the option. The option does not make such a field acceptable.
+// message that names the option. The option does not make such a field acceptable. The message names
+// the option also when another `_` key comes first.
 #[test]
 fn refuses_the_seal_passed_as_a_string_field() {
     let mut fields = creation_fields().to_vec();
-    fields.push(("_sealed_c", "1"));
+    fields.extend([("_note", "x"), ("_sealed_c", "1")]);
     for options in [
         TokenMetadataOptions::default(),
         TokenMetadataOptions {
@@ -255,6 +259,135 @@ fn refuses_a_seal_of_any_other_type_or_value_than_the_int64_1() {
         ]),
         "_sealed_c must be the Int64 1: build it with build_contract_seal_update"
     );
+}
+
+// Only genesis sets `_brn`, and the chain refuses an update that names it, a removal included.
+#[test]
+fn refuses_brn_as_a_value_and_as_a_removal() {
+    for value in [VMDynamicVariable::int256(70), removal()] {
+        assert_eq!(
+            update_refusal(vec![VMNamedDynamicVariable::new("_brn", value)]),
+            "_brn is set at genesis only"
+        );
+    }
+}
+
+// The chain reads `_phs` in block 0 only, so an update may not set it. A key that resembles the seal
+// is not the seal.
+#[test]
+fn refuses_a_value_for_an_underscore_key_the_chain_does_not_define() {
+    for (key, value) in [
+        ("_note", VMDynamicVariable::string("x")),
+        ("_phs", VMDynamicVariable::bytes(vec![1])),
+        ("_sealed", VMDynamicVariable::int64(1)),
+    ] {
+        assert_eq!(
+            update_refusal(vec![VMNamedDynamicVariable::new(key, value)]),
+            format!("{key} is reserved for the chain: an update can only remove it")
+        );
+    }
+}
+
+// A Dynamic value without data is stored like any other value, so it does not remove the key.
+#[test]
+fn refuses_the_dynamic_value_without_data_for_such_a_key() {
+    let value = VMDynamicVariable::new(VMType::Dynamic, VMValue::None);
+    assert_eq!(
+        update_refusal(vec![VMNamedDynamicVariable::new("_note", value)]),
+        "_note is reserved for the chain: an update can only remove it"
+    );
+}
+
+// The update is checked rule by rule in a fixed order: the token id, the field count, the seal,
+// `_brn`, then the other `_` keys. An update that breaks several rules gets the message of the first.
+// A struct is sorted by name, so in each pair the field of the later rule comes first.
+#[test]
+fn reports_the_first_rule_an_update_breaks() {
+    let err =
+        build_update_token_metadata_tx(0, VMDynamicStruct::default(), OWNER, TxLimits::default())
+            .unwrap_err();
+    assert_eq!(
+        builder_message(err),
+        "token_id must be between 1 and 2^64 - 1: the chain assigns no token id 0"
+    );
+    assert_eq!(
+        update_refusal(vec![
+            VMNamedDynamicVariable::new("_brn", VMDynamicVariable::int64(1)),
+            VMNamedDynamicVariable::new("_sealed_c", VMDynamicVariable::int64(2)),
+        ]),
+        "_sealed_c must be the Int64 1: build it with build_contract_seal_update"
+    );
+    assert_eq!(
+        update_refusal(vec![
+            VMNamedDynamicVariable::new("_brn", VMDynamicVariable::int64(1)),
+            VMNamedDynamicVariable::new("_alias", VMDynamicVariable::int64(1)),
+        ]),
+        "_brn is set at genesis only"
+    );
+}
+
+// The arguments are the C# SDK's vector: the token id, one field, the name `_note`, the type byte of
+// Array_Dynamic (0x01) and its u32 item count 0. The chain reads exactly this value as a removal.
+#[test]
+fn removes_such_a_key_with_an_empty_array_dynamic() {
+    let args = update_args(vec![VMNamedDynamicVariable::new("_note", removal())]);
+    assert_eq!(
+        hex::encode_upper(args),
+        "2A0000000000000001000000055F6E6F74650100000000"
+    );
+}
+
+// The keys an update may set, as the chain names them. The SDK checks the reserve only, so an Int64
+// stands for every setting; the chain checks the type of each one itself. The seal takes only the
+// Int64 1, which the seal update carries.
+#[test]
+fn lets_an_update_set_every_chain_key() {
+    for key in [
+        "_soi", "_sot", "_srt", "_srp", "_srm", "_srd", "_sl", "_sbt", "_sbm", "_sbd", "_sbl",
+        "_ip", "_ia", "_iib", "_iie", "_ifr",
+    ] {
+        let args: UpdateTokenMetadataArgs =
+            deserialize(update_args(vec![VMNamedDynamicVariable::new(
+                key,
+                VMDynamicVariable::int64(1),
+            )]))
+            .unwrap();
+        assert_eq!(
+            args.metadata.get(key),
+            Some(&VMDynamicVariable::int64(1)),
+            "{key}"
+        );
+    }
+    let args: UpdateTokenMetadataArgs =
+        deserialize(update_args(build_contract_seal_update().fields)).unwrap();
+    assert_eq!(args.metadata, build_contract_seal_update());
+}
+
+// The string fields of a new token cannot hold a chain setting, because the chain's settings are
+// typed values. `_sl` and `_brn` are chain keys and still refused here.
+#[test]
+fn refuses_a_string_field_whose_key_starts_with_an_underscore() {
+    for key in ["_note", "_sl", "_brn", "_phs"] {
+        let mut fields = creation_fields().to_vec();
+        fields.push((key, "x"));
+        assert_eq!(
+            builder_message(build_token_metadata(&fields).unwrap_err()),
+            format!("{key} is reserved for the chain: string metadata fields cannot start with _")
+        );
+    }
+}
+
+// Only the first character counts.
+#[test]
+fn takes_a_key_whose_underscore_is_not_its_first_character() {
+    let mut fields = creation_fields().to_vec();
+    fields.extend([("my_note", "a"), ("note_", "b")]);
+    let metadata: VMDynamicStruct = deserialize(build_token_metadata(&fields).unwrap()).unwrap();
+    assert_eq!(
+        metadata.get("my_note"),
+        Some(&VMDynamicVariable::string("a"))
+    );
+    assert_eq!(metadata.get("note_"), Some(&VMDynamicVariable::string("b")));
 }
 
 // The planner has no formula for this call, so the signing variant plans it with the script budget,
