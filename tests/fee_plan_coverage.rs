@@ -13,16 +13,17 @@ mod common;
 use std::collections::HashSet;
 
 use phantasma_sdk::{
-    build_token_info, build_token_metadata, plan_fees, required_witnesses, serialize,
-    BurnFungibleArgs, BurnNonFungibleArgs, Bytes32, FeePlanOptions, GovernanceContractMethod, IntX,
-    MintFungibleArgs, MintPhantasmaNonFungibleArgs, ModuleId, NativeFeeKind, PhantasmaNFTMintInfo,
-    RegisterNameArgs, SeriesInfo, SmallString, TokenContractMethod, TransferFungibleArgs,
-    TransferNonFungibleArgs, TxMsg, TxMsgBurnFungible, TxMsgBurnFungibleGasPayer,
-    TxMsgBurnNonFungible, TxMsgBurnNonFungibleGasPayer, TxMsgCall, TxMsgCallMulti,
-    TxMsgMintFungible, TxMsgMintNonFungible, TxMsgPhantasma, TxMsgPhantasmaRaw, TxMsgTrade,
-    TxMsgTransferFungible, TxMsgTransferFungibleGasPayer, TxMsgTransferNonFungibleMulti,
-    TxMsgTransferNonFungibleMultiGasPayer, TxMsgTransferNonFungibleSingle,
-    TxMsgTransferNonFungibleSingleGasPayer, TxPayload, TxType,
+    build_contract_seal_update, build_token_info, build_token_metadata, plan_fees,
+    required_witnesses, serialize, BurnFungibleArgs, BurnNonFungibleArgs, Bytes32, FeePlanOptions,
+    GovernanceContractMethod, IntX, MintFungibleArgs, MintPhantasmaNonFungibleArgs, ModuleId,
+    NativeFeeKind, PhantasmaNFTMintInfo, RegisterNameArgs, SeriesInfo, SmallString,
+    TokenContractMethod, TransferFungibleArgs, TransferNonFungibleArgs, TxMsg, TxMsgBurnFungible,
+    TxMsgBurnFungibleGasPayer, TxMsgBurnNonFungible, TxMsgBurnNonFungibleGasPayer, TxMsgCall,
+    TxMsgCallMulti, TxMsgMintFungible, TxMsgMintNonFungible, TxMsgPhantasma, TxMsgPhantasmaRaw,
+    TxMsgTrade, TxMsgTransferFungible, TxMsgTransferFungibleGasPayer,
+    TxMsgTransferNonFungibleMulti, TxMsgTransferNonFungibleMultiGasPayer,
+    TxMsgTransferNonFungibleSingle, TxMsgTransferNonFungibleSingleGasPayer, TxPayload, TxType,
+    UpdateTokenMetadataArgs,
 };
 
 use common::{address_of, base_tx, keys, v2_config};
@@ -417,13 +418,25 @@ fn token_method_cases(owner: Bytes32, to: Bytes32) -> Vec<(u32, Vec<u8>, NativeF
             .unwrap(),
             NativeFeeKind::MintPhantasmaNonFungible,
         ),
+        // The planner has no formula for a metadata update. It prices the call with the script
+        // budget, an upper bound, and this row states that decision for the arguments the SDK
+        // writes.
+        (
+            TokenContractMethod::UpdateTokenMetadata as u32,
+            serialize(&UpdateTokenMetadataArgs {
+                token_id: 9,
+                metadata: build_contract_seal_update(),
+            })
+            .unwrap(),
+            NativeFeeKind::Script,
+        ),
     ];
     // Every other method of the module is budgeted. MintNonFungible is among them on purpose: the
     // chain refuses an explicit NFT mint where governance has not allowed caller-supplied ROM ids,
     // whichever way it arrives, so there is nothing to price.
-    let modelled: HashSet<u32> = cases.iter().map(|(method, _, _)| *method).collect();
+    let listed: HashSet<u32> = cases.iter().map(|(method, _, _)| *method).collect();
     for method in 0u32..=(TokenContractMethod::MintPhantasmaNonFungible as u32) {
-        if !modelled.contains(&method) {
+        if !listed.contains(&method) {
             cases.push((method, PROBE_ARGS.to_vec(), NativeFeeKind::Script));
         }
     }

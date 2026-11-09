@@ -219,6 +219,63 @@ fn main() -> Result<()> {
 }
 ```
 
+## Changing Token Metadata
+
+`build_update_token_metadata_tx` builds `Token.UpdateTokenMetadata`, signed by the token owner. The
+chain merges an update into the stored metadata field by field, so a field the update does not name
+keeps its value. A field is removed by sending it as an empty `ArrayDynamic`. This is the only value
+the chain reads as a removal:
+
+```rust
+use phantasma_sdk::{
+    build_update_token_metadata_tx, bytes32_from_public_key, PhantasmaKeys, PhantasmaRpc, Result,
+    SendTransactionOptions, TxLimits, TxSigner, VMDynamicStruct, VMDynamicVariable,
+    VMNamedDynamicVariable, VMType, VMValue,
+};
+
+async fn change_metadata(client: &PhantasmaRpc, keys: &PhantasmaKeys, token_id: u64) -> Result<String> {
+    let update = VMDynamicStruct::new(vec![
+        VMNamedDynamicVariable::new("description", VMDynamicVariable::string("A new description")),
+        VMNamedDynamicVariable::new(
+            "website",
+            VMDynamicVariable::new(VMType::ArrayDynamic, VMValue::ArrayDynamic(Vec::new())),
+        ),
+    ]);
+    let owner = bytes32_from_public_key(&keys.public_key())?;
+    let msg = build_update_token_metadata_tx(token_id, update, owner, TxLimits::default())?;
+    let signers: [&dyn TxSigner; 1] = [keys];
+    client.send_tx_msg(&msg, &signers, &SendTransactionOptions::default()).await
+}
+```
+
+The planner prices `Token.UpdateTokenMetadata` with the script budget, so its plan is an upper bound
+(`plan.exact` is `false`). The chain charges the transfer fee and the storage the update adds.
+`build_update_token_metadata_tx_and_sign` plans and signs the call in one step, like the other
+`build_*_tx_and_sign` helpers.
+
+## Sealing a Token Against Contracts
+
+A sealed token never gets a VM contract, from its owner or from governance. Only a token without a
+contract can be sealed, and the seal cannot be removed.
+
+The seal blocks VM contracts only. A sealed token can be minted, transferred and burned, and it can
+get new NFT series and NFT mints. Its other metadata fields can be changed.
+
+The seal is the metadata field `_sealed_c` holding the Int64 value 1.
+
+Seal a token when it is created:
+
+```rust
+let metadata = build_token_metadata_with_options(&fields, TokenMetadataOptions { seal_contract: true })?;
+```
+
+Seal a token that already exists:
+
+```rust
+let msg = build_update_token_metadata_tx(token_id, build_contract_seal_update(), owner, TxLimits::default())?;
+let hash = client.send_tx_msg(&msg, &signers, &SendTransactionOptions::default()).await?;
+```
+
 ## Verification
 
 Use `just verify` for the normal local gate:

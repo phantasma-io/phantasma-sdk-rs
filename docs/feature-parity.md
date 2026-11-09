@@ -19,10 +19,10 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
 - Carbon transactions: typed `TxMsg` payloads, `SignedTxMsg`, witnesses,
   deterministic signing with any number of witnesses through `TxSigner`, native
   transfer/mint/burn builders and token-call builders that write only the
-  caller's `TxLimits`, token creation, series creation, Phantasma NFT minting
-  helpers, parsed token-schema JSON shape (`TokenSchemasJson` /
-  `TokenSchemasJSON`), schema JSON-to-wire builders, market/config call args,
-  result parsers.
+  caller's `TxLimits`, token creation, token metadata updates, the contract seal
+  at creation and as an update, series creation, Phantasma NFT minting helpers,
+  parsed token-schema JSON shape (`TokenSchemasJson` / `TokenSchemasJSON`),
+  schema JSON-to-wire builders, market/config call args, result parsers.
 - Fee planning (gas model v2): `estimate_native_fee` prices every native
   operation from its rows, result and gas sites; `plan_fees` reads the
   operation, sizes and recipients out of the message and demands the facts it
@@ -98,6 +98,8 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
 - `tests/carbon_python_parity.rs` covers Python SDK parity for Carbon token,
   market, config, parsed schema JSON plus schema builders, and deterministic
   Phantasma NFT helper paths.
+- `tests/token_metadata.rs` covers the contract seal and the token metadata
+  update builder, with byte vectors from the C# and TypeScript SDKs.
 - `tests/rpc.rs` covers JSON-RPC request/response behavior through a mock
   transport.
 - `tests/carbon_envelopes.rs` and `tests/carbon_signing.rs` cover the witness

@@ -156,6 +156,9 @@ pub mod standard_meta {
     pub const TOKEN_PHANTASMA_ABI: &str = "_phb";
     pub const TOKEN_PRE_BURN: &str = "_brn";
     pub const TOKEN_INFLATION_PERIOD: &str = "_ip";
+    /// The contract seal. A token whose metadata holds this key with the Int64 1 never gets a VM
+    /// contract; see [`crate::TokenMetadataOptions::seal_contract`].
+    pub const TOKEN_SEALED_CONTRACT: &str = "_sealed_c";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -3927,7 +3930,39 @@ pub fn build_token_schemas_from_fields(
     Ok(schemas)
 }
 
+/// Options of [`build_token_metadata_with_options`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenMetadataOptions {
+    /// Seals the token against VM contracts at creation: the metadata gets `_sealed_c` = 1 as an
+    /// Int64. A sealed token never gets a VM contract, from its owner or from governance. Only a
+    /// token without a contract can be sealed, and the seal cannot be removed. The seal blocks VM
+    /// contracts only. A sealed token can be minted, transferred and burned, and it can get new NFT
+    /// series and NFT mints. Its other metadata fields can be changed.
+    pub seal_contract: bool,
+}
+
+/// Returns the serialized metadata of a new token. `fields` must hold `name`, `icon`, `url` and
+/// `description`; `icon` is a base64 data URI of a PNG, JPEG or WebP image.
 pub fn build_token_metadata(fields: &[(&str, &str)]) -> Result<Vec<u8>> {
+    build_token_metadata_with_options(fields, TokenMetadataOptions::default())
+}
+
+/// Returns the serialized metadata of a new token, as [`build_token_metadata`] does, with the
+/// given options.
+pub fn build_token_metadata_with_options(
+    fields: &[(&str, &str)],
+    options: TokenMetadataOptions,
+) -> Result<Vec<u8>> {
+    // The chain takes the seal only as the Int64 1, and these fields are strings. So the seal key is
+    // refused here with a message that names the option.
+    if fields
+        .iter()
+        .any(|(name, _)| *name == standard_meta::TOKEN_SEALED_CONTRACT)
+    {
+        return builder(
+            "pass TokenMetadataOptions { seal_contract: true } to seal a token against contracts: _sealed_c holds the Int64 1, which a string field cannot carry",
+        );
+    }
     for required in ["name", "icon", "url", "description"] {
         let Some((_, value)) = fields.iter().find(|(name, _)| *name == required) else {
             return builder(format!(
@@ -3946,15 +3981,30 @@ pub fn build_token_metadata(fields: &[(&str, &str)]) -> Result<Vec<u8>> {
         .map(|(_, value)| *value)
         .unwrap_or("");
     validate_icon_data_uri(icon)?;
-    let structure = VMDynamicStruct::new(
-        fields
-            .iter()
-            .map(|(name, value)| {
-                VMNamedDynamicVariable::new(*name, VMDynamicVariable::string(*value))
-            })
-            .collect(),
-    );
-    serialize(&structure)
+    let mut metadata_fields: Vec<_> = fields
+        .iter()
+        .map(|(name, value)| VMNamedDynamicVariable::new(*name, VMDynamicVariable::string(*value)))
+        .collect();
+    if options.seal_contract {
+        metadata_fields.push(contract_seal_field());
+    }
+    serialize(&VMDynamicStruct::new(metadata_fields))
+}
+
+/// Returns the metadata update that seals an existing token against VM contracts, for
+/// [`build_update_token_metadata_tx`]. The chain merges an update into the stored metadata, so
+/// every other field keeps its value. The rules of the seal are those of
+/// [`TokenMetadataOptions::seal_contract`]; a token that has a VM contract cannot be sealed.
+pub fn build_contract_seal_update() -> VMDynamicStruct {
+    VMDynamicStruct::new(vec![contract_seal_field()])
+}
+
+// Returns the seal in the one form the chain takes: `_sealed_c` holding the Int64 1.
+fn contract_seal_field() -> VMNamedDynamicVariable {
+    VMNamedDynamicVariable::new(
+        standard_meta::TOKEN_SEALED_CONTRACT,
+        VMDynamicVariable::int64(1),
+    )
 }
 
 pub fn build_token_info(
@@ -4131,6 +4181,80 @@ pub fn build_create_token_tx_and_sign_hex(
 ) -> Result<String> {
     Ok(hex::encode(build_create_token_tx_and_sign(
         token_info, signer, config, options,
+    )?))
+}
+
+/// Builds a Token.UpdateTokenMetadata call, which the token owner or governance sends to change a
+/// token's metadata. The message carries the limits given and nothing else; see
+/// [`build_create_token_tx`]. [`build_contract_seal_update`] returns the update that seals a token
+/// against VM contracts.
+///
+/// The chain merges the update into the stored metadata field by field, so a field the update
+/// leaves out keeps its value. A field is removed by sending it as an empty
+/// [`VMType::ArrayDynamic`] value, the only form the chain reads as a removal. A
+/// [`VMType::Dynamic`] value without data is stored like any other value.
+///
+/// The planner has no formula for this call and prices it with the script budget, so the plan is
+/// an upper bound (`exact` is false). The chain charges the transfer fee and the storage the
+/// token's row grows by.
+pub fn build_update_token_metadata_tx(
+    token_id: u64,
+    metadata: VMDynamicStruct,
+    owner: Bytes32,
+    limits: TxLimits,
+) -> Result<TxMsg> {
+    if token_id == 0 {
+        return builder("token_id must be between 1 and 2^64 - 1: the chain assigns no token id 0");
+    }
+    if metadata.fields.is_empty() {
+        return builder("a metadata update needs at least one field");
+    }
+    // The chain takes the seal only as the Int64 1, and a seal cannot be removed. Every field of
+    // that name is checked, because a struct can hold the same name twice.
+    if metadata.fields.iter().any(|field| {
+        field.name.as_str() == standard_meta::TOKEN_SEALED_CONTRACT
+            && *field != contract_seal_field()
+    }) {
+        return builder("_sealed_c must be the Int64 1: build it with build_contract_seal_update");
+    }
+    let args = UpdateTokenMetadataArgs { token_id, metadata };
+    Ok(call_tx(
+        owner,
+        limits,
+        TxMsgCall {
+            module_id: ModuleId::Token as u32,
+            method_id: TokenContractMethod::UpdateTokenMetadata as u32,
+            args: serialize(&args)?,
+            sections: None,
+        },
+    ))
+}
+
+/// Builds a Token.UpdateTokenMetadata call, plans it against `config` and signs it with the
+/// owner's keys. A call whose offer `options.limits` already fixes is signed as it is. See
+/// [`build_update_token_metadata_tx`] and [`crate::plan_and_sign_with_keys`].
+pub fn build_update_token_metadata_tx_and_sign(
+    token_id: u64,
+    metadata: VMDynamicStruct,
+    signer: &PhantasmaKeys,
+    config: Option<&GasConfig>,
+    options: &PlanAndSignOptions,
+) -> Result<Vec<u8>> {
+    let owner = bytes32_from_public_key(&signer.public_key())?;
+    let msg = build_update_token_metadata_tx(token_id, metadata, owner, options.limits)?;
+    plan_and_sign_with_keys(&msg, &[signer], config, options)
+}
+
+/// Returns the envelope of [`build_update_token_metadata_tx_and_sign`] as lowercase hex.
+pub fn build_update_token_metadata_tx_and_sign_hex(
+    token_id: u64,
+    metadata: VMDynamicStruct,
+    signer: &PhantasmaKeys,
+    config: Option<&GasConfig>,
+    options: &PlanAndSignOptions,
+) -> Result<String> {
+    Ok(hex::encode(build_update_token_metadata_tx_and_sign(
+        token_id, metadata, signer, config, options,
     )?))
 }
 
