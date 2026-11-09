@@ -494,6 +494,144 @@ fn array_struct_metadata_round_trips_with_schema() {
     assert_eq!(names, vec!["one", "two"]);
 }
 
+/// Returns the schema of a struct whose children the builders convert: Bytes, Bytes32 and Int64.
+fn convertible_children_schema() -> VMStructSchema {
+    VMStructSchema::new(vec![
+        VMNamedVariableSchema::make("blob", VMType::Bytes),
+        VMNamedVariableSchema::make("root", VMType::Bytes32),
+        VMNamedVariableSchema::make("big", VMType::Int64),
+    ])
+}
+
+/// Returns struct children in forms the builders convert: Bytes and Bytes32 as hex strings, and an
+/// Int64 as an Int256 in the unsigned range.
+fn children_to_convert(blob: &str, root: &str, big: u64) -> VMDynamicStruct {
+    VMDynamicStruct::new(vec![
+        VMNamedDynamicVariable::make("blob", VMType::Bytes, VMValue::String(blob.into())),
+        VMNamedDynamicVariable::make("root", VMType::Bytes32, VMValue::String(root.into())),
+        VMNamedDynamicVariable::make("big", VMType::Int64, VMValue::Int256(BigInt::from(big))),
+    ])
+}
+
+/// Returns the values of the children of a struct read back by `convertible_children_schema`.
+fn children_read_back(children: &VMDynamicStruct) -> [VMValue; 3] {
+    ["blob", "root", "big"].map(|name| children.get(name).unwrap().data.clone())
+}
+
+// A struct child is converted by its schema as a top-level field is. The ROM, read back by its
+// schema, holds the converted values: the bytes of the hex string, the 32 bytes of the 64 hex digits
+// and the Int64 that the unsigned maximum stands for.
+#[test]
+fn struct_metadata_children_are_written_as_converted_values() {
+    let schema = VMStructSchema::new(vec![
+        VMNamedVariableSchema::make("_i", VMType::Int256),
+        VMNamedVariableSchema::make("rom", VMType::Bytes),
+        VMNamedVariableSchema::make_with_struct(
+            "stats",
+            VMType::Struct,
+            convertible_children_schema(),
+        ),
+    ]);
+    let stats = children_to_convert("0x0a0b", &"11".repeat(32), u64::MAX);
+    let rom = build_nft_rom(&schema, 1, &[("stats", VMValue::Struct(stats))]).unwrap();
+    let decoded = VMDynamicStruct::read_with_schema(&schema, &mut CarbonReader::new(&rom)).unwrap();
+    let VMValue::Struct(stats) = &decoded.get("stats").unwrap().data else {
+        panic!("expected a struct");
+    };
+    assert_eq!(
+        children_read_back(stats),
+        [
+            VMValue::Bytes(vec![0x0a, 0x0b]),
+            VMValue::Bytes32(Bytes32([0x11; 32])),
+            VMValue::Int(-1),
+        ]
+    );
+}
+
+// Each struct of an Array_Struct field is converted on its own, in the same way.
+#[test]
+fn array_struct_metadata_items_are_written_as_converted_values() {
+    let item_schema = convertible_children_schema();
+    let schema = VMStructSchema::new(vec![
+        VMNamedVariableSchema::make("_i", VMType::Int256),
+        VMNamedVariableSchema::make("rom", VMType::Bytes),
+        VMNamedVariableSchema::make_with_struct("items", VMType::ArrayStruct, item_schema.clone()),
+    ]);
+    let items = VMStructArray {
+        schema: item_schema,
+        structs: vec![
+            children_to_convert("0x0a0b", &"11".repeat(32), u64::MAX),
+            children_to_convert("0c", &"22".repeat(32), 1 << 63),
+        ],
+    };
+    let rom = build_nft_rom(&schema, 1, &[("items", VMValue::ArrayStruct(items))]).unwrap();
+    let decoded = VMDynamicStruct::read_with_schema(&schema, &mut CarbonReader::new(&rom)).unwrap();
+    let VMValue::ArrayStruct(items) = &decoded.get("items").unwrap().data else {
+        panic!("expected a struct array");
+    };
+    let read_back: Vec<_> = items.structs.iter().map(children_read_back).collect();
+    assert_eq!(
+        read_back,
+        vec![
+            [
+                VMValue::Bytes(vec![0x0a, 0x0b]),
+                VMValue::Bytes32(Bytes32([0x11; 32])),
+                VMValue::Int(-1),
+            ],
+            [
+                VMValue::Bytes(vec![0x0c]),
+                VMValue::Bytes32(Bytes32([0x22; 32])),
+                VMValue::Int(i64::MIN),
+            ],
+        ]
+    );
+}
+
+// The conversion keeps the checks of a struct: every child the schema names must be present in its
+// exact case, and a child the schema does not name is refused.
+#[test]
+fn struct_metadata_children_keep_their_checks() {
+    let schema = VMStructSchema::new(vec![
+        VMNamedVariableSchema::make("_i", VMType::Int256),
+        VMNamedVariableSchema::make("rom", VMType::Bytes),
+        VMNamedVariableSchema::make_with_struct(
+            "stats",
+            VMType::Struct,
+            convertible_children_schema(),
+        ),
+    ]);
+    let refusal = |fields: Vec<VMNamedDynamicVariable>| {
+        build_nft_rom(
+            &schema,
+            1,
+            &[("stats", VMValue::Struct(VMDynamicStruct::new(fields)))],
+        )
+        .unwrap_err()
+        .to_string()
+    };
+    let blob = VMNamedDynamicVariable::make("blob", VMType::Bytes, VMValue::Bytes(vec![1]));
+    let root =
+        VMNamedDynamicVariable::make("root", VMType::Bytes32, VMValue::Bytes32(Bytes32([1; 32])));
+    let big = VMNamedDynamicVariable::make("big", VMType::Int64, VMValue::Int(1));
+    assert_eq!(
+        refusal(vec![blob.clone(), root.clone()]),
+        "builder error: metadata field \"big\" is mandatory"
+    );
+    assert_eq!(
+        refusal(vec![
+            VMNamedDynamicVariable::make("Blob", VMType::Bytes, VMValue::Bytes(vec![1])),
+            root.clone(),
+            big.clone(),
+        ]),
+        "builder error: metadata field \"blob\" provided in incorrect case as \"Blob\""
+    );
+    let extra = VMNamedDynamicVariable::make("extra", VMType::String, VMValue::String("x".into()));
+    assert_eq!(
+        refusal(vec![blob, root, big, extra]),
+        "builder error: metadata field \"stats\" received unknown property \"extra\""
+    );
+}
+
 #[test]
 fn carbon_address_and_signing_helpers_match_shared_vector() {
     // Carbon signing helper uses the same public-key Bytes32 address as the other SDKs.

@@ -4982,8 +4982,7 @@ fn coerce_metadata_value(
             let VMValue::Struct(value) = value else {
                 return builder(format!("metadata field \"{name}\" must be a struct"));
             };
-            validate_metadata_struct(name, struct_def, value)?;
-            VMValue::Struct(value.clone())
+            VMValue::Struct(coerce_metadata_struct(name, struct_def, value)?)
         }
         VMType::ArrayStruct => {
             let struct_def = schema.struct_def.as_ref().ok_or_else(|| {
@@ -4996,10 +4995,18 @@ fn coerce_metadata_value(
                     "metadata field \"{name}\" must be provided as a struct array"
                 ));
             };
-            for (index, item) in value.structs.iter().enumerate() {
-                validate_metadata_struct(&format!("{name}[{index}]"), struct_def, item)?;
-            }
-            VMValue::ArrayStruct(value.clone())
+            let structs = value
+                .structs
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    coerce_metadata_struct(&format!("{name}[{index}]"), struct_def, item)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            VMValue::ArrayStruct(VMStructArray {
+                schema: value.schema.clone(),
+                structs,
+            })
         }
         VMType::ArrayDynamic => match value {
             VMValue::ArrayDynamic(value) => VMValue::ArrayDynamic(value.clone()),
@@ -5077,32 +5084,44 @@ fn coerce_metadata_value(
     })
 }
 
-fn validate_metadata_struct(
+// Returns the struct of a Struct field, or one struct of an Array_Struct field, with each child
+// converted by its schema and typed as the schema says. The children keep the caller's order. Every
+// child the schema names must be present, and a child the schema does not name is refused.
+fn coerce_metadata_struct(
     parent_name: &str,
     schema: &VMStructSchema,
     value: &VMDynamicStruct,
-) -> Result<()> {
+) -> Result<VMDynamicStruct> {
+    // The writer takes each child's data as it is and writes it as the schema's type. Data of
+    // another form is written as the type's empty or zero value, so a child given as a hex string
+    // for Bytes would be written empty. The struct is therefore rebuilt from the converted values.
+    let mut converted = Vec::with_capacity(schema.fields.len());
     for field_schema in &schema.fields {
         let name = field_schema.name.0.as_str();
-        let Some(value) = find_struct_field(value, name)? else {
+        let Some(given) = find_struct_field(value, name)? else {
             return builder(format!("metadata field \"{name}\" is mandatory"));
         };
-        coerce_metadata_value(name, &field_schema.schema, &value.data)?;
-    }
-    for field in &value.fields {
-        if schema
-            .fields
-            .iter()
-            .any(|schema_field| schema_field.name == field.name)
-        {
-            continue;
-        }
-        return builder(format!(
-            "metadata field \"{parent_name}\" received unknown property \"{}\"",
-            field.name.0
+        converted.push(VMNamedDynamicVariable::new(
+            field_schema.name.clone(),
+            VMDynamicVariable::new(
+                field_schema.schema.vm_type,
+                coerce_metadata_value(name, &field_schema.schema, &given.data)?,
+            ),
         ));
     }
-    Ok(())
+    // Each child the schema names has a converted child of that name now, so a caller field
+    // without one is a child the schema does not name.
+    let mut fields = Vec::with_capacity(value.fields.len());
+    for field in &value.fields {
+        let Some(child) = converted.iter().find(|child| child.name == field.name) else {
+            return builder(format!(
+                "metadata field \"{parent_name}\" received unknown property \"{}\"",
+                field.name.0
+            ));
+        };
+        fields.push(child.clone());
+    }
+    Ok(VMDynamicStruct { fields })
 }
 
 fn find_struct_field<'a>(
