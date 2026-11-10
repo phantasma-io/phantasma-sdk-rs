@@ -1637,17 +1637,32 @@ impl CarbonSerializable for TokenSchemas {
     }
 }
 
+/// A field of a token schema as [`parse_token_schemas_json`] reads it: its name, its VM type and,
+/// for a Struct or Array_Struct field, the fields of its struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenSchemaField {
     pub name: String,
     pub vm_type: VMType,
+    /// The fields of a Struct field, or of each struct of an Array_Struct field. Empty for the
+    /// other types.
+    pub fields: Vec<TokenSchemaField>,
 }
 
 impl TokenSchemaField {
     pub fn new(name: impl Into<String>, vm_type: VMType) -> Self {
+        Self::with_fields(name, vm_type, Vec::new())
+    }
+
+    /// Returns a Struct or Array_Struct field with the fields of its struct.
+    pub fn with_fields(
+        name: impl Into<String>,
+        vm_type: VMType,
+        fields: Vec<TokenSchemaField>,
+    ) -> Self {
         Self {
             name: name.into(),
             vm_type,
+            fields,
         }
     }
 }
@@ -3816,6 +3831,9 @@ pub fn token_schemas_from_json(data: &str) -> Result<TokenSchemas> {
     build_token_schemas_from_fields(&parsed.series_metadata, &parsed.rom, &parsed.ram)
 }
 
+/// Reads token schemas from JSON: three arrays of fields, `seriesMetadata`, `rom` and `ram`. A
+/// field is `{ "name", "type" }`, and a Struct or Array_Struct field also has `fields`, the fields
+/// of its struct in the same form.
 pub fn parse_token_schemas_json(data: &str) -> Result<TokenSchemasJson> {
     let raw: Value = serde_json::from_str(data)
         .map_err(|err| PhantasmaError::Builder(format!("invalid token schema JSON: {err}")))?;
@@ -4881,31 +4899,71 @@ fn parse_token_schema_field_array(
     let Some(items) = raw.get(key).and_then(Value::as_array) else {
         return builder(format!("{key} must be an array"));
     };
-    let mut out = Vec::with_capacity(items.len());
-    for (index, item) in items.iter().enumerate() {
-        let Some(object) = item.as_object() else {
-            return builder(format!("{key} field {index} invalid"));
-        };
-        let Some(name) = object.get("name").and_then(Value::as_str) else {
-            return builder(format!("{key} field name must be string"));
-        };
-        let Some(raw_type) = object.get("type").and_then(Value::as_str) else {
-            return builder(format!("{key} field type must be string"));
-        };
-        out.push(TokenSchemaField::new(name, vm_type_from_string(raw_type)?));
-    }
-    Ok(out)
+    items
+        .iter()
+        .map(|item| parse_token_schema_field(item, key))
+        .collect()
 }
 
-// Returns the schema of one field.
+// Reads one field of a token schema. `path` names the list the field stands in, for the error
+// messages: the list's key, then `.name` for each struct field around it.
+fn parse_token_schema_field(item: &Value, path: &str) -> Result<TokenSchemaField> {
+    let Some(object) = item.as_object() else {
+        return builder(format!("{path} field must be an object"));
+    };
+    let Some(name) = object.get("name").and_then(Value::as_str) else {
+        return builder(format!("{path} field name must be string"));
+    };
+    let Some(raw_type) = object.get("type").and_then(Value::as_str) else {
+        return builder(format!("{path} field type must be string"));
+    };
+    let vm_type = vm_type_from_string(raw_type)?;
+    let field_path = format!("{path}.{name}");
+    let type_name = vm_type_name(vm_type)?;
+    // The chain keeps the schema of a struct inside the schema of a Struct or Array_Struct field,
+    // and writes the field's values by it. So such a field cannot be built without its fields.
+    if !matches!(vm_type, VMType::Struct | VMType::ArrayStruct) {
+        if object.contains_key("fields") {
+            return builder(format!(
+                "{field_path} has the type {type_name} and cannot have fields"
+            ));
+        }
+        return Ok(TokenSchemaField::new(name, vm_type));
+    }
+    let Some(children) = object.get("fields").and_then(Value::as_array) else {
+        return builder(format!(
+            "{field_path} has the type {type_name} and needs a fields array"
+        ));
+    };
+    if children.is_empty() {
+        return builder(format!(
+            "{field_path} has the type {type_name} and needs at least one field"
+        ));
+    }
+    let fields = children
+        .iter()
+        .map(|child| parse_token_schema_field(child, &field_path))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(TokenSchemaField::with_fields(name, vm_type, fields))
+}
+
+// Returns the schema of one field. A field with fields gets the schema of its struct. That schema
+// has no flags.
 fn named_schema_from_field(field: &TokenSchemaField) -> Result<VMNamedVariableSchema> {
     // The checked constructor returns an error for a name over 255 UTF-8 bytes. The conversion from
     // `&str` would panic on it.
     let name = SmallString::new(field.name.as_str())?;
-    Ok(VMNamedVariableSchema {
-        name,
-        schema: VMVariableSchema::new(field.vm_type),
-    })
+    let schema = if field.fields.is_empty() {
+        VMVariableSchema::new(field.vm_type)
+    } else {
+        let fields = field
+            .fields
+            .iter()
+            .map(named_schema_from_field)
+            .collect::<Result<Vec<_>>>()?;
+        VMVariableSchema::with_struct(field.vm_type, VMStructSchema::new(fields))
+    };
+    Ok(VMNamedVariableSchema { name, schema })
 }
 
 fn is_phantasma_nft_reserved_field(name: &str) -> bool {

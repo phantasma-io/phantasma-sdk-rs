@@ -22,8 +22,9 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
   caller's `TxLimits`, token creation, token metadata updates, the contract seal
   at creation and as an update, the refusal of the metadata keys the chain keeps
   for itself, series creation, Phantasma NFT minting helpers, parsed
-  token-schema JSON shape (`TokenSchemasJson` / `TokenSchemasJSON`), schema
-  JSON-to-wire builders, market/config call args, result parsers.
+  token-schema JSON shape (`TokenSchemasJson` / `TokenSchemasJSON`) with the
+  fields of struct fields, schema JSON-to-wire builders, market/config call args,
+  result parsers.
 - Fee planning (gas model v2): `estimate_native_fee` prices every native
   operation from its rows, result and gas sites; `plan_fees` reads the
   operation, sizes and recipients out of the message and demands the facts it
@@ -102,6 +103,8 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
 - `tests/token_metadata.rs` covers the contract seal, the token metadata update
   builder and the refusal of the keys the chain keeps for itself, with byte
   vectors from the C# and TypeScript SDKs.
+- `tests/token_schemas_json.rs` covers token schemas JSON with struct fields,
+  its refusals, and NFT data written by such a schema.
 - `tests/rpc.rs` covers JSON-RPC request/response behavior through a mock
   transport.
 - `tests/carbon_envelopes.rs` and `tests/carbon_signing.rs` cover the witness

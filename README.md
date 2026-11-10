@@ -219,6 +219,57 @@ fn main() -> Result<()> {
 }
 ```
 
+## NFT Token Schemas and Metadata Values
+
+An NFT token is created with three schemas: `seriesMetadata` (the data a series shares), `rom` (the
+data an NFT gets at its mint and keeps) and `ram` (the data of an NFT that can change). The schemas of
+a token cannot change after it is created. `token_schemas_from_json` builds them from JSON. A field is
+`{ "name": ..., "type": ... }`, and the type is the name of a VM type, such as `String`, `Int32`,
+`Bytes32` or `Array_Int64`. A `Struct` or `Array_Struct` field also lists the fields of its struct, in
+the same form:
+
+```json
+{
+  "seriesMetadata": [],
+  "rom": [
+    { "name": "name", "type": "String" },
+    { "name": "description", "type": "String" },
+    { "name": "imageURL", "type": "String" },
+    { "name": "infoURL", "type": "String" },
+    { "name": "royalties", "type": "Int32" },
+    {
+      "name": "stats",
+      "type": "Struct",
+      "fields": [
+        { "name": "level", "type": "Int32" },
+        { "name": "class", "type": "String" }
+      ]
+    }
+  ],
+  "ram": []
+}
+```
+
+The SDK adds its own fields: `_i` and `rom` to the `rom` schema, and `_i`, `mode` and `rom` to the
+`seriesMetadata` schema. The fields `name`, `description`, `imageURL`, `infoURL` and `royalties` must
+be in `rom` or in `seriesMetadata`.
+
+The builders of NFT data and series metadata (`build_phantasma_nft_rom`, `build_nft_rom`,
+`build_token_series_metadata`) take each value as a `VMValue` and check it against the field's type:
+
+| Type | Value |
+|---|---|
+| `String` | a `String` that is not blank |
+| `Int8`, `Int16`, `Int32` | an `Int` or an `Int256` |
+| `Int64`, `Int256` | the same |
+| `Bytes` | `Bytes` or a hex `String` |
+| `Bytes16`, `Bytes32`, `Bytes64` | the same, of exactly 16, 32 or 64 bytes, or `Bytes16`, `Bytes32` or `Bytes64` |
+| `Struct` | a `Struct` with a value for every field of the struct |
+| `Array_...` | the array of the item type |
+
+An integer can be given in the signed range of its type or in the unsigned range, which is written as
+its two's complement.
+
 ## Changing Token Metadata
 
 `build_update_token_metadata_tx` builds `Token.UpdateTokenMetadata`, signed by the token owner. The
