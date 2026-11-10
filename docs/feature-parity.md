@@ -16,7 +16,8 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
 - Carbon serialization: fixed bytes, zero-terminated strings, arrays, BigInt,
   `IntX`, generic and typed integer arrays, dynamic VM schemas/structs, token
   metadata, token info, series info, NFT ROM/RAM helpers. Their values take
-  digit strings for Int64 and Int256.
+  digit strings for Int64 and Int256, and typed values (`MetadataDynamicValue`)
+  for Dynamic fields.
 - Carbon transactions: typed `TxMsg` payloads, `SignedTxMsg`, witnesses,
   deterministic signing with any number of witnesses through `TxSigner`, native
   transfer/mint/burn builders and token-call builders that write only the
@@ -86,6 +87,14 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
   and plain bools where `false` is costlier; unstated counts are `Option`. The
   native builders take parameter structs with an `Option<Bytes32>` gas payer
   instead of a zero-address sentinel.
+- A typed value for a Dynamic metadata field is a `MetadataDynamicValue`. The
+  C# and TypeScript builders take any object as a value, and the Rust builders
+  take a `VMValue`, so the typed value reaches them as `VMValue::MetadataDynamic`
+  or, for an Array_Dynamic field, `VMValue::ArrayMetadataDynamic`. The builders
+  convert it into `VMValue::Dynamic`. The reader never returns these variants,
+  and the writer refuses them, so a typed value is never written unconverted.
+  The SDK's own `VMValue::Dynamic` and `VMValue::ArrayDynamic` are still taken
+  as they are.
 
 ## Test Sources
 
@@ -107,7 +116,8 @@ TypeScript, C++, and Go SDKs where those SDKs expose the same surface.
 - `tests/token_schemas_json.rs` covers token schemas JSON with struct fields,
   its refusals, and NFT data written by such a schema.
 - `tests/metadata_values.rs` covers the values of NFT data: digit strings for
-  Int64 and Int256, with byte vectors from the TypeScript SDK.
+  Int64 and Int256, typed values for Dynamic fields and the SDK's own VM dynamic
+  variables, with byte vectors from the C# and TypeScript SDKs.
 - `tests/rpc.rs` covers JSON-RPC request/response behavior through a mock
   transport.
 - `tests/carbon_envelopes.rs` and `tests/carbon_signing.rs` cover the witness

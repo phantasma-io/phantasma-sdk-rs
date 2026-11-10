@@ -1168,6 +1168,32 @@ pub enum VMValue {
     ArrayBytes32(Vec<Bytes32>),
     ArrayBytes64(Vec<Bytes64>),
     ArrayString(Vec<String>),
+    /// A typed value for a Dynamic field, for the metadata builders. They convert it and write it
+    /// as a `Dynamic` value. The reader never returns it, and the writer refuses it.
+    MetadataDynamic(Box<MetadataDynamicValue>),
+    /// Typed values for an Array_Dynamic field, for the metadata builders. They convert them and
+    /// write them as an `ArrayDynamic` value. The reader never returns them, and the writer refuses
+    /// them.
+    ArrayMetadataDynamic(Vec<MetadataDynamicValue>),
+}
+
+/// The value of a Dynamic metadata field, or of one item of an Array_Dynamic field. Such a field
+/// can hold a value of any VM type, and the chain stores the type with the value, so the type is
+/// named here. The metadata builders take it as [`VMValue::MetadataDynamic`] or, for an
+/// Array_Dynamic field, as [`VMValue::ArrayMetadataDynamic`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataDynamicValue {
+    /// The type the chain stores with the value. It cannot be Dynamic, Array_Dynamic, Struct or
+    /// Array_Struct.
+    pub vm_type: VMType,
+    /// The value, given as for a metadata field of `vm_type`.
+    pub value: VMValue,
+}
+
+impl MetadataDynamicValue {
+    pub fn new(vm_type: VMType, value: VMValue) -> Self {
+        Self { vm_type, value }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1207,6 +1233,18 @@ impl VMDynamicVariable {
         schema: Option<&VMStructSchema>,
         writer: &mut CarbonWriter,
     ) -> Result<bool> {
+        // Data that does not match the type is written below as an empty or zero value of the type.
+        // A typed metadata value written that way would lose its value. In an Array_Dynamic field
+        // it would be an empty Array_Dynamic, which a token metadata update reads as the removal of
+        // the field. So it is refused here.
+        if matches!(
+            self.data,
+            VMValue::MetadataDynamic(_) | VMValue::ArrayMetadataDynamic(_)
+        ) {
+            return serialization(
+                "a MetadataDynamicValue is converted by the metadata builders and cannot be written as it is",
+            );
+        }
         match vm_type {
             VMType::Dynamic => {
                 let inner = match &self.data {
@@ -5031,8 +5069,8 @@ fn coerce_metadata_value(
 ) -> Result<VMValue> {
     // Coercion is intentionally narrow: bytes may be real bytes or hex strings,
     // integer widths accept their unsigned two's-complement input range, Int64
-    // and Int256 also take strings of decimal digits, and nested structures must
-    // match the declared schema exactly.
+    // and Int256 also take strings of decimal digits, a Dynamic field takes a
+    // typed value, and nested structures must match the declared schema exactly.
     Ok(match schema.vm_type {
         VMType::Bytes => VMValue::Bytes(coerce_metadata_bytes(name, value)?),
         VMType::String => VMValue::String(coerce_metadata_string(name, value)?),
@@ -5080,10 +5118,20 @@ fn coerce_metadata_value(
             })
         }
         VMType::ArrayDynamic => match value {
+            // The SDK's own VM dynamic variables are written as they are.
             VMValue::ArrayDynamic(value) => VMValue::ArrayDynamic(value.clone()),
+            VMValue::ArrayMetadataDynamic(values) => VMValue::ArrayDynamic(
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        coerce_metadata_dynamic_value(&format!("{name}[{index}]"), value)
+                    })
+                    .collect::<Result<_>>()?,
+            ),
             _ => {
                 return builder(format!(
-                    "metadata field \"{name}\" must contain dynamic VM variables"
+                    "metadata field \"{name}\" is Array_Dynamic and must be given as a list of MetadataDynamicValue"
                 ));
             }
         },
@@ -5168,11 +5216,15 @@ fn coerce_metadata_value(
             _ => return builder(format!("metadata field \"{name}\" must be a string array")),
         },
         VMType::Dynamic => match value {
+            // The SDK's own VM dynamic variable is written as it is.
             VMValue::Dynamic(value) => VMValue::Dynamic(value.clone()),
+            VMValue::MetadataDynamic(value) => {
+                VMValue::Dynamic(Box::new(coerce_metadata_dynamic_value(name, value)?))
+            }
             _ => {
                 return builder(format!(
-                    "metadata field \"{name}\" must be a dynamic VM variable"
-                ))
+                    "metadata field \"{name}\" is Dynamic and must be given as a MetadataDynamicValue"
+                ));
             }
         },
         VMType::Array => return serialization("unsupported VM dynamic type: Array"),
@@ -5217,6 +5269,35 @@ fn coerce_metadata_struct(
         fields.push(child.clone());
     }
     Ok(VMDynamicStruct { fields })
+}
+
+// Returns the VM variable a Dynamic field stores for a typed value, converted for its own type.
+fn coerce_metadata_dynamic_value(
+    name: &str,
+    value: &MetadataDynamicValue,
+) -> Result<VMDynamicVariable> {
+    // A Dynamic value is written with its own type and without a schema. A MetadataDynamicValue
+    // names one type, so it cannot give the types of the fields of a Struct or Array_Struct. It
+    // takes no Dynamic or Array_Dynamic value either, because no use is known for typed values
+    // nested in a typed value. Array has the code of Array_Dynamic. So a Dynamic value holds a
+    // scalar or an array of scalars.
+    if matches!(
+        value.vm_type,
+        VMType::Dynamic
+            | VMType::ArrayDynamic
+            | VMType::Array
+            | VMType::Struct
+            | VMType::ArrayStruct
+    ) {
+        return builder(format!(
+            "metadata field \"{name}\" cannot hold a Dynamic value of type {}",
+            vm_type_name(value.vm_type)?
+        ));
+    }
+    Ok(VMDynamicVariable::new(
+        value.vm_type,
+        coerce_metadata_value(name, &VMVariableSchema::new(value.vm_type), &value.value)?,
+    ))
 }
 
 fn find_struct_field<'a>(

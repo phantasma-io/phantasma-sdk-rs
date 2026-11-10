@@ -265,10 +265,34 @@ The builders of NFT data and series metadata (`build_phantasma_nft_rom`, `build_
 | `Bytes` | `Bytes` or a hex `String` |
 | `Bytes16`, `Bytes32`, `Bytes64` | the same, of exactly 16, 32 or 64 bytes, or `Bytes16`, `Bytes32` or `Bytes64` |
 | `Struct` | a `Struct` with a value for every field of the struct |
+| `Dynamic` | a `MetadataDynamic`: the type and the value |
 | `Array_...` | the array of the item type; `Array_Int64` and `Array_Int256` also take an `ArrayString` of decimal digits |
 
 An integer can be given in the signed range of its type or in the unsigned range, which is written as
 its two's complement.
+
+The chain stores a value of any type in a `Dynamic` field, together with that type. The SDK takes such
+a value as `VMValue::MetadataDynamic(Box<MetadataDynamicValue>)`, whose `value` is given as for a
+field of its `vm_type`. The `vm_type` cannot be `Dynamic`, `Array_Dynamic`, `Struct` or
+`Array_Struct`. An `Array_Dynamic` field takes `VMValue::ArrayMetadataDynamic`, a vector of such
+values:
+
+```rust
+let level = VMValue::MetadataDynamic(Box::new(MetadataDynamicValue::new(
+    VMType::Int64,
+    VMValue::String("9007199254740993".into()),
+)));
+let tags = VMValue::ArrayMetadataDynamic(vec![
+    MetadataDynamicValue::new(VMType::String, VMValue::String("rare".into())),
+    MetadataDynamicValue::new(VMType::Bytes, VMValue::String("0xdead".into())),
+]);
+```
+
+A `Dynamic` field also takes a `VMValue::Dynamic` around the SDK's own `VMDynamicVariable`, and an
+`Array_Dynamic` field a `VMValue::ArrayDynamic` of them. The builders write those as they are. Read
+back by its schema, a `Dynamic` field is a `VMDynamicVariable` of type `Dynamic` whose data is a
+`VMValue::Dynamic` around the stored value, which keeps its own type. Only the builders convert a
+`MetadataDynamicValue`, and the writer refuses one that reaches it unconverted.
 
 ## Changing Token Metadata
 
