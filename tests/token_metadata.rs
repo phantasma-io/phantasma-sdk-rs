@@ -390,6 +390,29 @@ fn takes_a_key_whose_underscore_is_not_its_first_character() {
     assert_eq!(metadata.get("note_"), Some(&VMDynamicVariable::string("b")));
 }
 
+// A field name is a SmallString of at most 255 UTF-8 bytes. A name of 255 bytes is written, and a
+// longer name comes back as the crate's SmallString error.
+#[test]
+fn takes_a_field_name_of_255_bytes_and_refuses_a_longer_one_with_an_error() {
+    let longest = "k".repeat(255);
+    let mut fields = creation_fields().to_vec();
+    fields.push((longest.as_str(), "fits"));
+    let metadata: VMDynamicStruct = deserialize(build_token_metadata(&fields).unwrap()).unwrap();
+    assert_eq!(
+        metadata.get(&longest),
+        Some(&VMDynamicVariable::string("fits"))
+    );
+
+    let too_long = "k".repeat(256);
+    let mut fields = creation_fields().to_vec();
+    fields.push((too_long.as_str(), "too long"));
+    let err = build_token_metadata(&fields).unwrap_err();
+    assert!(
+        matches!(&err, PhantasmaError::Serialization(message) if message == "SmallString exceeds 255 UTF-8 bytes"),
+        "{err:?}"
+    );
+}
+
 // The planner has no formula for this call, so the signing variant plans it with the script budget,
 // an upper bound. The SDK's own reader decodes the envelope back into the message that was planned,
 // signed by the owner.

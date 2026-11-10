@@ -3906,20 +3906,17 @@ pub fn build_token_schemas_from_fields(
     ram: &[TokenSchemaField],
 ) -> Result<TokenSchemas> {
     let mut series = standard_series_fields();
-    series.extend(
-        series_metadata
-            .iter()
-            .map(|field| VMNamedVariableSchema::new(field.name.as_str(), field.vm_type)),
-    );
+    for field in series_metadata {
+        series.push(named_schema_from_field(field)?);
+    }
     let mut rom_fields = standard_nft_fields();
-    rom_fields.extend(
-        rom.iter()
-            .map(|field| VMNamedVariableSchema::new(field.name.as_str(), field.vm_type)),
-    );
-    let ram_fields: Vec<_> = ram
+    for field in rom {
+        rom_fields.push(named_schema_from_field(field)?);
+    }
+    let ram_fields = ram
         .iter()
-        .map(|field| VMNamedVariableSchema::new(field.name.as_str(), field.vm_type))
-        .collect();
+        .map(named_schema_from_field)
+        .collect::<Result<Vec<_>>>()?;
     let schemas = TokenSchemas {
         series_metadata: VMStructSchema::new(series),
         rom: VMStructSchema::new(rom_fields),
@@ -3996,10 +3993,17 @@ pub fn build_token_metadata_with_options(
         .map(|(_, value)| *value)
         .unwrap_or("");
     validate_icon_data_uri(icon)?;
-    let mut metadata_fields: Vec<_> = fields
+    // A field name is a SmallString of at most 255 UTF-8 bytes. The checked constructor returns an
+    // error for a longer name. The conversion from `&str` would panic on it.
+    let mut metadata_fields = fields
         .iter()
-        .map(|(name, value)| VMNamedDynamicVariable::new(*name, VMDynamicVariable::string(*value)))
-        .collect();
+        .map(|(name, value)| {
+            Ok(VMNamedDynamicVariable::new(
+                SmallString::new(*name)?,
+                VMDynamicVariable::string(*value),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     if options.seal_contract {
         metadata_fields.push(contract_seal_field());
     }
@@ -4891,6 +4895,17 @@ fn parse_token_schema_field_array(
         out.push(TokenSchemaField::new(name, vm_type_from_string(raw_type)?));
     }
     Ok(out)
+}
+
+// Returns the schema of one field.
+fn named_schema_from_field(field: &TokenSchemaField) -> Result<VMNamedVariableSchema> {
+    // The checked constructor returns an error for a name over 255 UTF-8 bytes. The conversion from
+    // `&str` would panic on it.
+    let name = SmallString::new(field.name.as_str())?;
+    Ok(VMNamedVariableSchema {
+        name,
+        schema: VMVariableSchema::new(field.vm_type),
+    })
 }
 
 fn is_phantasma_nft_reserved_field(name: &str) -> bool {
