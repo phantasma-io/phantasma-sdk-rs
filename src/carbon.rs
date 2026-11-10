@@ -5030,19 +5030,17 @@ fn coerce_metadata_value(
     value: &VMValue,
 ) -> Result<VMValue> {
     // Coercion is intentionally narrow: bytes may be real bytes or hex strings,
-    // integer widths accept their unsigned two's-complement input range, and
-    // nested structures must match the declared schema exactly.
+    // integer widths accept their unsigned two's-complement input range, Int64
+    // and Int256 also take strings of decimal digits, and nested structures must
+    // match the declared schema exactly.
     Ok(match schema.vm_type {
         VMType::Bytes => VMValue::Bytes(coerce_metadata_bytes(name, value)?),
         VMType::String => VMValue::String(coerce_metadata_string(name, value)?),
-        VMType::Int8 | VMType::Int16 | VMType::Int32 | VMType::Int64 => VMValue::Int(
+        VMType::Int8 | VMType::Int16 | VMType::Int32 => VMValue::Int(
             coerce_metadata_integer_for_type(name, schema.vm_type, metadata_integer(name, value)?)?,
         ),
-        VMType::Int256 => {
-            let value = metadata_bigint(name, value)?;
-            validate_int256(name, &value)?;
-            VMValue::Int256(value)
-        }
+        VMType::Int64 => VMValue::Int(coerce_metadata_int64(name, value)?),
+        VMType::Int256 => VMValue::Int256(coerce_metadata_int256(name, value)?),
         VMType::Bytes16 => VMValue::Bytes16(coerce_metadata_fixed_bytes16(name, value)?),
         VMType::Bytes32 => VMValue::Bytes32(coerce_metadata_fixed_bytes32(name, value)?),
         VMType::Bytes64 => VMValue::Bytes64(coerce_metadata_fixed_bytes64(name, value)?),
@@ -5111,6 +5109,18 @@ fn coerce_metadata_value(
         },
         VMType::ArrayInt64 => match value {
             VMValue::ArrayInt64(value) => VMValue::ArrayInt64(value.clone()),
+            VMValue::ArrayString(items) => VMValue::ArrayInt64(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        coerce_metadata_int64(
+                            &format!("{name}[{index}]"),
+                            &VMValue::String(item.clone()),
+                        )
+                    })
+                    .collect::<Result<_>>()?,
+            ),
             _ => return builder(format!("metadata field \"{name}\" must be an int64 array")),
         },
         VMType::ArrayInt256 => match value {
@@ -5120,6 +5130,18 @@ fn coerce_metadata_value(
                 }
                 VMValue::ArrayInt256(value.clone())
             }
+            VMValue::ArrayString(items) => VMValue::ArrayInt256(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        coerce_metadata_int256(
+                            &format!("{name}[{index}]"),
+                            &VMValue::String(item.clone()),
+                        )
+                    })
+                    .collect::<Result<_>>()?,
+            ),
             _ => return builder(format!("metadata field \"{name}\" must be an int256 array")),
         },
         VMType::ArrayBytes16 => match value {
@@ -5268,6 +5290,45 @@ fn coerce_metadata_fixed_bytes64(name: &str, value: &VMValue) -> Result<Bytes64>
             ))
         }),
     }
+}
+
+// Returns the Int64 a metadata value stands for. The value is a number or a string of decimal
+// digits, in the signed range or in the unsigned range, which is written as its two's complement.
+fn coerce_metadata_int64(name: &str, value: &VMValue) -> Result<i64> {
+    let number = metadata_number(name, value)?;
+    coerce_metadata_integer_for_type(name, VMType::Int64, metadata_integer(name, &number)?)
+}
+
+// Returns the Int256 a metadata value stands for. The value is a number or a string of decimal
+// digits, in the signed range or in the unsigned range.
+fn coerce_metadata_int256(name: &str, value: &VMValue) -> Result<BigInt> {
+    let number = metadata_bigint(name, &metadata_number(name, value)?)?;
+    validate_int256(name, &number)?;
+    Ok(number)
+}
+
+// Returns a number given for an Int64 or Int256 field as it is, and a string of decimal digits as
+// the Int256 it stands for, so that it takes the range checks of a number. The string form takes
+// values that arrive as text: a JSON number above 2^53 - 1 loses digits in JavaScript, so such
+// numbers are often written as strings.
+fn metadata_number(name: &str, value: &VMValue) -> Result<VMValue> {
+    let digits = match value {
+        VMValue::Int(_) | VMValue::Int256(_) => return Ok(value.clone()),
+        VMValue::String(text) if is_decimal_integer(text) => text.parse::<BigInt>().ok(),
+        _ => None,
+    };
+    digits.map(VMValue::Int256).ok_or_else(|| {
+        PhantasmaError::Builder(format!(
+            "metadata field \"{name}\" must be an integer or a string of decimal digits"
+        ))
+    })
+}
+
+// Returns true if the whole text is decimal digits with an optional leading minus: no space, no
+// plus sign, no hex prefix and no line break.
+fn is_decimal_integer(text: &str) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn metadata_integer(name: &str, value: &VMValue) -> Result<i128> {

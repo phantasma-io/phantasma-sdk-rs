@@ -104,7 +104,7 @@ fn serializes_struct_and_array_struct_fields_with_the_schemas_of_their_structs()
 
 // NFT data built by the ROM schema from JSON holds the values only, in the order of the schema, the
 // struct fields by the schemas of their structs. The bytes are the TypeScript SDK's for the same
-// input. The fields of a struct can come in any order.
+// input. The fields of a struct can come in any order, and an item id can be a digit string.
 #[test]
 fn builds_the_nft_data_of_struct_fields_by_the_schema_from_json() {
     let schemas = token_schemas_from_json(&schemas_json(&format!("{STATS}, {ITEMS}"))).unwrap();
@@ -150,7 +150,10 @@ fn builds_the_nft_data_of_struct_fields_by_the_schema_from_json() {
                         "id",
                         VMType::Int64,
                     )]),
-                    structs: vec![id(VMValue::Int(9_007_199_254_740_993)), id(VMValue::Int(2))],
+                    structs: vec![
+                        id(VMValue::String("9007199254740993".into())),
+                        id(VMValue::Int(2)),
+                    ],
                 }),
             ),
         ],

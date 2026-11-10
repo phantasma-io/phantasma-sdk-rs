@@ -261,11 +261,11 @@ The builders of NFT data and series metadata (`build_phantasma_nft_rom`, `build_
 |---|---|
 | `String` | a `String` that is not blank |
 | `Int8`, `Int16`, `Int32` | an `Int` or an `Int256` |
-| `Int64`, `Int256` | the same |
+| `Int64`, `Int256` | the same, or a `String` of decimal digits such as `"-12"` or `"9007199254740993"` |
 | `Bytes` | `Bytes` or a hex `String` |
 | `Bytes16`, `Bytes32`, `Bytes64` | the same, of exactly 16, 32 or 64 bytes, or `Bytes16`, `Bytes32` or `Bytes64` |
 | `Struct` | a `Struct` with a value for every field of the struct |
-| `Array_...` | the array of the item type |
+| `Array_...` | the array of the item type; `Array_Int64` and `Array_Int256` also take an `ArrayString` of decimal digits |
 
 An integer can be given in the signed range of its type or in the unsigned range, which is written as
 its two's complement.
