@@ -25,7 +25,7 @@ malformed input with explicit errors instead of panicking.
 
 ```toml
 [dependencies]
-phantasma-sdk = "2"
+phantasma-sdk = "4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
